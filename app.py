@@ -3,6 +3,8 @@ import pandas as pd
 import re
 import os
 from dotenv import load_dotenv
+from models import InvoiceItem, OrderDetails
+from pydantic import ValidationError
 
 load_dotenv()
 
@@ -120,7 +122,11 @@ def refine_data(raw_text: str) -> str:
     return text
 
 
-def parse_items(text: str) -> list[dict]:
+from models import InvoiceItem, OrderDetails
+
+def parse_items(text: str) -> list[InvoiceItem]:
+    """Parse line items out of cleaned invoice text into validated InvoiceItem models."""
+
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
     items = []
@@ -130,84 +136,76 @@ def parse_items(text: str) -> list[dict]:
 
         if (
             i + 9 < len(lines)
-            and re.match(r"^\d+$", lines[i])                
-            and re.match(r"^\d+\.\d+$", lines[i + 1])          
+            and re.match(r"^\d+$", lines[i])
+            and re.match(r"^\d+\.\d+$", lines[i + 1])
         ):
 
             try:
-                item = {
-                    
-                    "item_number": lines[i + 4],
-                    "description": lines[i + 7],
-                    "uom": lines[i + 5],
-                    "qty_shipped": int(lines[i + 3]),
-                    "unit_price": format(float(lines[i + 1]),".2f"),
-                    "extended_amount": format(float(lines[i + 9]),".2f"),
-                }
+                item = InvoiceItem(
+                    item_number=lines[i + 4],
+                    description=lines[i + 7],
+                    uom=lines[i + 5],
+                    qty_shipped=lines[i + 3],
+                    unit_price=lines[i + 1],
+                    extended_amount=lines[i + 9],
+                )
 
                 items.append(item)
 
                 i += 10
                 continue
 
-            except Exception:
+            except (ValidationError, IndexError):
                 pass
 
         i += 1
+
     return items
 
 
-
-def extract_order_details(text: str) -> dict:
-    """Pull invoice-level metadata (customer, dates, totals) from cleaned invoice text."""
+def extract_order_details(text: str) -> OrderDetails:
+    """Pull invoice-level metadata from cleaned invoice text into a validated OrderDetails model."""
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
-    # After refine_data, the buyer name is left as its own standalone line
-    # (keep_buyer_name already stripped away "SOLD TO:"/"SHIPPED TO:" entirely)
     customer_name = lines[0] if lines else None
 
     dates = re.findall(r"\d{2}/\d{2}/\d{2}", text)
 
-    invoice_match = re.search(
-        r"\b\d{6}[A-Z]?\b",
-        text
-    )
+    invoice_match = re.search(r"\b\d{6}[A-Z]?\b", text)
 
     customer_number = None
     salesperson = None
-    truck_route = None
 
     for idx, line in enumerate(lines):
         if re.fullmatch(r"\d{1,5}", line):
             customer_number = line
             if idx + 1 < len(lines):
                 salesperson = lines[idx + 1]
-            if idx + 2 < len(lines):
-                truck_route = lines[idx + 2]
             break
 
-    # After refine_data, keep_total leaves "Invoice Total: $X.XX" behind
     total_match = re.search(
         r"Invoice Total:\s*\$([\d,]+\.\d{2})",
         text,
         flags=re.IGNORECASE
     )
 
-    return {
-        "customer_number": customer_number,
-        "customer_name": customer_name,
-        "customer_purchase_order": salesperson,
-        "delivery_date": dates[1] if len(dates) > 1 else None,
-        "invoice_number": invoice_match.group(0) if invoice_match else None,
-        "total_cost": total_match.group(1) if total_match else None
-    }
+    return OrderDetails(
+        customer_number=customer_number,
+        customer_name=customer_name,
+        customer_purchase_order=salesperson,
+        delivery_date=dates[1] if len(dates) > 1 else None,
+        invoice_number=invoice_match.group(0) if invoice_match else None,
+        total_cost=total_match.group(1) if total_match else None,
+    )
 
+def export_items_csv(order_data: dict, output_folder: str = "pdf_output") -> str:
+    """Build a flat CSV (order details + 0,0 placeholders + items, no header row)."""
 
-def export_items_csv(order_data: dict, output_folder: str ="pdf_output") -> str:
-    df = pd.DataFrame(order_data["items"])
+    items_as_dicts = [item.model_dump() for item in order_data["items"]]
+    df = pd.DataFrame(items_as_dicts)
 
-    details = order_data["order_details"]
+    details = order_data["order_details"].model_dump()
     for key in reversed(list(details.keys())):
         df.insert(0, key, details[key])
 
@@ -225,9 +223,10 @@ def export_items_csv(order_data: dict, output_folder: str ="pdf_output") -> str:
     os.makedirs(output_folder, exist_ok=True)
     output_path = os.path.join(output_folder, filename)
 
-    df.to_csv(output_path, header=False, index=False)
-    
+    df.to_csv(output_path, header=False, index=False, float_format="%.2f")
+
     return output_path
+
 
 
 if __name__ == '__main__':
