@@ -1,0 +1,20 @@
+Welcome to Martins Distribution Invoice Processing Application
+
+This application is intended to be used to extract the information from a pdf file of an invoice into relevant values that can be exported to 
+our clients as csv. 
+
+- The command to turn this project into a single executable file is the following: 
+
+  pyinstaller ^
+      --onefile ^
+      --windowed ^
+      --clean ^
+      --noconfirm ^
+      --icon="Martins-Distribution_RGB.ico" ^
+      --collect-all tkinterdnd2 ^
+      --collect-all pydantic_core ^
+      --collect-all pymupdf ^
+      --add-data "Martins-Distribution_RGB.ico;." ^
+      MDIP.py
+
+Once this is run you will have MDIP.exe (Martins Distribution Invoice Processing) executable file ready to be downloaded on any device. 
