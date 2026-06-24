@@ -31,7 +31,9 @@ def resource_path(relative_path: str) -> str:
     base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
     return str(base_path / relative_path)
 
-# Helper function for tkinter windows
+# ---------------------------------------------------------------------------
+# Helper functions for tkinter windows
+# ---------------------------------------------------------------------------
 def center_window(window, width: int, height: int):
     window.withdraw()  # hide 
 
@@ -46,6 +48,14 @@ def center_window(window, width: int, height: int):
     window.geometry(f"{width}x{height}+{x}+{y}")
 
     window.deiconify()  # reveal 
+
+def bring_to_front(window):
+    """Force a window to the foreground on launch, without keeping it pinned on top forever."""
+    window.lift()
+    window.attributes("-topmost", True)
+    window.focus_force()
+    window.after(100, lambda: window.attributes("-topmost", False))
+
 
 # ---------------------------------------------------------------------------
 # Config persistence
@@ -192,8 +202,8 @@ class ConfigScreen(tk.Toplevel):
         self.title("Configuration")
         self.configure(bg=BG)
         self.resizable(False, False)
-        # self.geometry("500x360")
         center_window(self, 500, 360)
+        bring_to_front(self.root)
         self.grab_set()  
         self.iconbitmap(resource_path("Martins-Distribution_RGB.ico"))
         self.on_save = on_save
@@ -448,8 +458,8 @@ class App:
         self.root.title("Invoice Processor")
         self.root.configure(bg=BG)
         self.root.resizable(False, False)
-        # self.root.geometry("540x580")
         center_window(self.root, 540, 580)
+        bring_to_front(self.root)
         self.root.iconbitmap(resource_path("Martins-Distribution_RGB.ico"))
         config = load_config()
 
