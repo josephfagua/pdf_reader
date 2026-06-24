@@ -10,7 +10,6 @@ Requires:
 """
 
 import os
-import shutil
 from pathlib import Path
 import json
 import threading
