@@ -119,8 +119,6 @@ def refine_data(raw_text: str) -> str:
     return text
 
 
-from src.models import InvoiceItem, OrderDetails
-
 def parse_items(text: str) -> list[InvoiceItem]:
     """Parse line items out of cleaned invoice text into validated InvoiceItem models."""
 
