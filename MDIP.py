@@ -202,7 +202,7 @@ class ConfigScreen(tk.Toplevel):
         self.configure(bg=BG)
         self.resizable(False, False)
         center_window(self, 500, 360)
-        bring_to_front(self.root)
+        bring_to_front(self)
         self.grab_set()  
         self.iconbitmap(resource_path("Martins-Distribution_RGB.ico"))
         self.on_save = on_save
