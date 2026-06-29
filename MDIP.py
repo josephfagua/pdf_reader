@@ -1,5 +1,5 @@
 """
-gui.py — Invoice Pipeline Launcher
+MDIP.py — Invoice Pipeline Launcher
 
 Pages:
   - Config screen (first launch or via button): set input + output folders
@@ -10,12 +10,17 @@ Requires:
 """
 
 import os
+import time
+import subprocess
+import ctypes
 from pathlib import Path
 import json
 import threading
 import sys
+import pathlib
+import datetime
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, ttk, messagebox
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -24,17 +29,31 @@ except ImportError:
     DND_AVAILABLE = False
 
 from src.main import extract_text, refine_data, parse_items, extract_order_details, export_items_csv
+from src.logging_config import setup_logging, get_logger, log_event
+
+
+# ---------------------------------------------------------------------------
+# Current user — resolved once at startup, used in status bar + log entries
+# ---------------------------------------------------------------------------
+
+try:
+    CURRENT_USER = os.getlogin()
+except Exception:
+    CURRENT_USER = os.environ.get("USERNAME", "unknown")
+
+
+# ---------------------------------------------------------------------------
+# Helper functions for tkinter windows
+# ---------------------------------------------------------------------------
 
 def resource_path(relative_path: str) -> str:
     """Get an absolute path to a resource, works for dev and for PyInstaller .exe"""
     base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
     return str(base_path / relative_path)
 
-# ---------------------------------------------------------------------------
-# Helper functions for tkinter windows
-# ---------------------------------------------------------------------------
+
 def center_window(window, width: int, height: int):
-    window.withdraw()  # hide 
+    window.withdraw()  # hide
 
     window.update_idletasks()
 
@@ -46,7 +65,28 @@ def center_window(window, width: int, height: int):
 
     window.geometry(f"{width}x{height}+{x}+{y}")
 
-    window.deiconify()  # reveal 
+    window.deiconify()  # reveal
+
+
+def center_over(window, parent_window, width: int, height: int):
+    """Center a window over a parent window (rather than the screen)."""
+    window.withdraw()  # hide
+
+    window.update_idletasks()
+    parent_window.update_idletasks()
+
+    parent_x = parent_window.winfo_x()
+    parent_y = parent_window.winfo_y()
+    parent_w = parent_window.winfo_width()
+    parent_h = parent_window.winfo_height()
+
+    x = parent_x + (parent_w - width) // 2
+    y = parent_y + (parent_h - height) // 2
+
+    window.geometry(f"{width}x{height}+{x}+{y}")
+
+    window.deiconify()  # reveal
+
 
 def bring_to_front(window):
     """Force a window to the foreground on launch, without keeping it pinned on top forever."""
@@ -60,13 +100,11 @@ def bring_to_front(window):
 # Config persistence
 # ---------------------------------------------------------------------------
 
-from pathlib import Path
-import os
-
 APP_DIR = Path(os.getenv("LOCALAPPDATA", Path.home())) / "MD Invoice Processor"
 APP_DIR.mkdir(parents=True, exist_ok=True)
 
 CONFIG_FILE = APP_DIR / "config.json"
+
 
 def load_config() -> dict:
     if os.path.isfile(CONFIG_FILE):
@@ -77,9 +115,11 @@ def load_config() -> dict:
             pass
     return {}
 
+
 def save_config(config: dict) -> None:
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=2)
+
 
 def is_config_valid(config: dict) -> bool:
     return bool(config.get("input_folder") and config.get("output_folder"))
@@ -96,58 +136,153 @@ ACCENT      = "#2563EB"
 ACCENT_DARK = "#1D4ED8"
 TEXT        = "#111827"
 TEXT_MUTED  = "#6B7280"
+SECONDARY_FG = "#888888"   # muted grey for the status bar
 SUCCESS_BG  = "#ECFDF5"
 SUCCESS_FG  = "#065F46"
 ERROR_BG    = "#FEF2F2"
 ERROR_FG    = "#991B1B"
 DROP_HOVER  = "#EFF6FF"
 
+# Pacing for status updates (seconds). Keeps each step on screen long enough
+# to actually be read, since the underlying pipeline runs almost instantly.
+STEP_DELAY = 0.4
+
+# Total number of steps tracked by the progress bar.
+TOTAL_STEPS = 5
+
+
+# ---------------------------------------------------------------------------
+# Module-level logger (initialised after setup_logging() is called at startup)
+# ---------------------------------------------------------------------------
+
+_logger = get_logger("mdip")
+
 
 # ---------------------------------------------------------------------------
 # Pipeline runner
 # ---------------------------------------------------------------------------
 
+# Machine name — resolved once, reused in every log entry.
+CURRENT_MACHINE = os.environ.get("COMPUTERNAME", "unknown")
+
+
 def run_pipeline(pdf_path: str, output_folder: str, status_callback) -> None:
+    """
+    Runs the full pipeline in a background thread, reporting progress via
+    status_callback(header, detail, step, is_error, success, output_path).
+
+    `header` is a short label meant for the dialog's prominent header text.
+    `detail` is optional longer text shown on a smaller line below — used
+    only for the final success/error states, empty during normal steps.
+
+    `step` is the progress bar value (1-TOTAL_STEPS) to display, or None to
+    leave the bar exactly where it currently is (used on error, so the bar
+    freezes at the point of failure instead of resetting).
+
+    `output_path` is only set on success, so the dialog can offer to reveal
+    the finished file once the user closes it.
+    """
     pdf_path = pdf_path.strip().strip("{}")
 
     if not os.path.isfile(pdf_path):
-        status_callback(f"File not found:\n{pdf_path}", is_error=True)
+        status_callback(
+            "File not found",
+            "We couldn't find that file. Please select it again using the "
+            "Browse button or drag it in.",
+            step=None,
+            is_error=True,
+        )
         return
 
     if not pdf_path.lower().endswith(".pdf"):
-        status_callback("Please select a PDF file.", is_error=True)
+        status_callback(
+            "Wrong file type",
+            "Please choose a PDF file — this looks like a different file type.",
+            step=None,
+            is_error=True,
+        )
         return
 
+    # Collect file metadata before processing starts.
+    invoice_filename = os.path.basename(pdf_path)
     try:
-        status_callback("Extracting text from PDF…", is_error=False)
+        file_size_kb = round(os.path.getsize(pdf_path) / 1024, 1)
+    except OSError:
+        file_size_kb = 0.0
+
+    start_time = time.monotonic()
+
+    try:
+        status_callback("Getting started…", "", step=1, is_error=False)
+        time.sleep(STEP_DELAY)
+
         raw_text = extract_text(pdf_path)
+        status_callback("Reading your invoice…", "", step=2, is_error=False)
+        time.sleep(STEP_DELAY)
 
-        status_callback("Cleaning invoice data…", is_error=False)
         cleaned_text = refine_data(raw_text)
+        status_callback("Organizing the details…", "", step=3, is_error=False)
+        time.sleep(STEP_DELAY)
 
-        status_callback("Parsing line items and order details…", is_error=False)
         order_data = {
             "order_details": extract_order_details(cleaned_text),
             "items":         parse_items(cleaned_text),
         }
+        item_count = len(order_data["items"])
+        status_callback("Finding your items and order info…", "", step=4, is_error=False)
+        time.sleep(STEP_DELAY)
 
-        status_callback("Exporting CSV…", is_error=False)
         os.makedirs(output_folder, exist_ok=True)
         output_path = export_items_csv(order_data, output_folder)
+        status_callback("Saving your file…", "", step=5, is_error=False)
+        time.sleep(STEP_DELAY)
 
-        # # Copy the original PDF into the output folder (not move)
-        # pdf_copy_dest = os.path.join(output_folder, os.path.basename(pdf_path))
-        # if os.path.abspath(pdf_path) != os.path.abspath(pdf_copy_dest):
-        #     shutil.copy2(pdf_path, pdf_copy_dest)
+        duration_s = round(time.monotonic() - start_time, 1)
 
         status_callback(
-            f"Done!\n\nCSV saved to:\n{output_path}\n",
+            "All done!",
+            f"Your processed invoice has been saved to:\n{output_path}",
+            step=5,
             is_error=False,
             success=True,
+            output_path=output_path,
+        )
+
+        log_event(
+            _logger,
+            user=CURRENT_USER,
+            machine=CURRENT_MACHINE,
+            invoice_file=invoice_filename,
+            file_size_kb=file_size_kb,
+            duration_s=duration_s,
+            item_count=item_count,
+            status="SUCCESS",
+            detail=os.path.basename(output_path),
         )
 
     except Exception as exc:
-        status_callback(f"Error during processing:\n{exc}", is_error=True)
+        duration_s = round(time.monotonic() - start_time, 1)
+        log_event(
+            _logger,
+            user=CURRENT_USER,
+            machine=CURRENT_MACHINE,
+            invoice_file=invoice_filename,
+            file_size_kb=file_size_kb,
+            duration_s=duration_s,
+            item_count=0,
+            status="ERROR",
+            detail=str(exc),
+        )
+        # The real exception is logged above; we show a friendly message to
+        # the user — raw tracebacks are meaningless and alarming to
+        # non-technical staff.
+        status_callback(
+            "Something went wrong",
+            "Please make sure it's a Martin's Distribution invoice PDF, then "
+            "try again. If this keeps happening, contact support.",
+            step=None,  # freeze the bar at whatever step it last reached
+            is_error=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -157,9 +292,11 @@ def run_pipeline(pdf_path: str, output_folder: str, status_callback) -> None:
 def divider(parent):
     tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", padx=24, pady=(0, 20))
 
+
 def section_label(parent, text):
     tk.Label(parent, text=text, bg=BG, fg=TEXT_MUTED,
              font=("Segoe UI", 9), anchor="w").pack(fill="x", padx=24)
+
 
 def folder_row(parent, label_text, path_var):
     """A labelled path entry + Browse button row. Returns the Entry widget."""
@@ -203,10 +340,11 @@ class ConfigScreen(tk.Toplevel):
         self.resizable(False, False)
         center_window(self, 500, 360)
         bring_to_front(self)
-        self.grab_set()  
+        self.grab_set()
         self.iconbitmap(resource_path("Martins-Distribution_RGB.ico"))
         self.on_save = on_save
         self.is_first_launch = is_first_launch
+        self._current_config = current_config  # preserved so _save can carry log_path forward
 
         # If closed via the X on first launch, quit the whole app
         if is_first_launch:
@@ -229,8 +367,8 @@ class ConfigScreen(tk.Toplevel):
         self.input_var  = tk.StringVar(value=current_config.get("input_folder", ""))
         self.output_var = tk.StringVar(value=current_config.get("output_folder", ""))
 
-        folder_row(self, "Input folder  (where your PDF invoices are located)", self.input_var)
-        folder_row(self, "Output folder  (where CSVs will be saved)", self.output_var)
+        folder_row(self, "Where are your invoice PDFs saved?", self.input_var)
+        folder_row(self, "Where should we save your finished files?", self.output_var)
 
         # Validation message
         self.validation_label = tk.Label(self, text="", bg=BG, fg=ERROR_FG,
@@ -250,24 +388,157 @@ class ConfigScreen(tk.Toplevel):
         output_folder = self.output_var.get().strip()
 
         if not input_folder or not output_folder:
-            self.validation_label.configure(text="Both folders are required.")
+            self.validation_label.configure(text="Please choose both an input and output folder.")
             return
 
         if not os.path.isdir(input_folder):
-            self.validation_label.configure(text="Input folder path does not exist.")
+            self.validation_label.configure(text="That input folder couldn't be found. Please check the path or use Browse.")
             return
 
         if not os.path.isdir(output_folder):
             try:
                 os.makedirs(output_folder, exist_ok=True)
             except OSError:
-                self.validation_label.configure(text="Could not create output folder.")
+                self.validation_label.configure(text="We couldn't create that output folder. Please choose a different location.")
                 return
 
-        config = {"input_folder": input_folder, "output_folder": output_folder}
+        config = {
+            "input_folder":  input_folder,
+            "output_folder": output_folder,
+            "log_path":      self._current_config.get("log_path", "\\\\SERVER\\MDIPLogs\\app.log"),
+        }
         save_config(config)
         self.on_save(config)
         self.destroy()
+
+
+# ---------------------------------------------------------------------------
+# Processing dialog (modal — shown while an invoice is being processed)
+# ---------------------------------------------------------------------------
+
+class ProcessingDialog(tk.Toplevel):
+    """
+    Modal dialog shown while an invoice is processed. Owns the progress bar
+    and status messages that used to live on MainScreen. Starts the pipeline
+    immediately on open. The window cannot be closed (X button is blocked)
+    until processing reaches a final state (success or error).
+    """
+
+    WIDTH = 420
+    HEIGHT = 260
+
+    def __init__(self, parent, pdf_path: str, output_folder: str):
+        super().__init__(parent)
+        self.parent = parent
+        self.is_finished = False
+        self.success = False
+        self.output_path = None
+
+        self.title("Processing Invoice")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        center_over(self, parent, self.WIDTH, self.HEIGHT)
+        bring_to_front(self)
+        self.iconbitmap(resource_path("Martins-Distribution_RGB.ico"))
+
+        # Block the X button until processing is finished
+        self.protocol("WM_DELETE_WINDOW", self._block_close)
+        self.grab_set()
+
+        self._build_ui()
+
+        threading.Thread(
+            target=run_pipeline,
+            args=(pdf_path, output_folder, self._thread_safe_status),
+            daemon=True,
+        ).start()
+
+    def _build_ui(self):
+        title_frame = tk.Frame(self, bg=BG)
+        title_frame.pack(fill="x", padx=24, pady=(24, 8))
+
+        self.header_label = tk.Label(title_frame, text="Getting started…", bg=BG, fg=TEXT,
+                                     font=("Segoe UI", 13, "bold"), anchor="w",
+                                     justify="left", wraplength=370)
+        self.header_label.pack(side="left")
+
+        self.progress_bar = ttk.Progressbar(
+            self, mode="determinate", maximum=TOTAL_STEPS, value=0
+        )
+        self.progress_bar.pack(fill="x", padx=24, pady=(8, 12))
+
+        self.status_frame = tk.Frame(self, bg=BG)
+        self.status_frame.pack(fill="x", padx=24, pady=(0, 16))
+
+        # Smaller detail line — empty during normal steps, used only to carry
+        # the full success/error message alongside the short header above.
+        self.status_label = tk.Label(self.status_frame, text="",
+                                     bg=BG, fg=TEXT_MUTED, font=("Segoe UI", 9),
+                                     anchor="w", justify="left", wraplength=370)
+        self.status_label.pack(fill="x")
+
+        self.close_btn = tk.Button(self, text="Close", command=self._on_close,
+                                   font=("Segoe UI", 10, "bold"),
+                                   bg="#93C5FD", fg="white",
+                                   activebackground=ACCENT_DARK, activeforeground="white",
+                                   relief="flat", cursor="hand2", pady=8,
+                                   state="disabled")
+        self.close_btn.pack(fill="x", padx=24, pady=(0, 20))
+
+    def _block_close(self):
+        """Ignore the X button while processing is still in progress."""
+        if self.is_finished:
+            self._on_close()
+        # else: do nothing — processing must reach a final state first
+
+    def _on_close(self):
+        if self.success and self.output_path:
+            self._reveal_output_file(self.output_path)
+        self.destroy()
+
+    def _reveal_output_file(self, path: str):
+        """Open Explorer with the finished file highlighted, so the user can
+        immediately see and act on it without hunting for it manually."""
+        try:
+            # Windows normally prevents background processes from stealing
+            # focus, which is why Explorer can open behind other windows.
+            # Calling this just before launching it allows the next window
+            # that requests focus to actually receive it.
+            ASFW_ANY = -1
+            ctypes.windll.user32.AllowSetForegroundWindow(ASFW_ANY)
+            subprocess.Popen(f'explorer /select,"{os.path.normpath(path)}"')
+        except Exception:
+            # Never let a failure here block the dialog from closing —
+            # worst case the user just doesn't get the folder popped open.
+            pass
+
+    def _thread_safe_status(self, header, detail, step, is_error, success=False, output_path=None):
+        self.parent.after(0, self._set_status, header, detail, step, is_error, success, output_path)
+
+    def _set_status(self, header, detail, step, is_error, success=False, output_path=None):
+        # step=None means "leave the progress bar exactly where it is" —
+        # used on error, so the bar freezes at the point of failure.
+        if step is not None:
+            self.progress_bar["value"] = step
+
+        if success:
+            bg, fg = SUCCESS_BG, SUCCESS_FG
+        elif is_error:
+            bg, fg = ERROR_BG, ERROR_FG
+        else:
+            bg, fg = BG, TEXT_MUTED
+
+        # Header always shows the short, prominent status; detail line below
+        # only carries text on the final success/error states.
+        self.header_label.configure(text=header, fg=fg if (success or is_error) else TEXT)
+        self.status_frame.configure(bg=bg)
+        self.status_label.configure(text=detail, bg=bg, fg=fg)
+
+        if success or is_error:
+            self.is_finished = True
+            self.success = success
+            self.output_path = output_path
+            self.close_btn.configure(state="normal", bg=ACCENT)
 
 
 # ---------------------------------------------------------------------------
@@ -289,11 +560,24 @@ class MainScreen(tk.Frame):
 
     def update_config(self, config: dict):
         self.config = config
+        self._refresh_output_preview()
 
     def _build_ui(self):
+        # ── User / clock — quiet annotation above the main header ─────
+        self.user_clock_label = tk.Label(
+            self,
+            text=self._status_bar_text(),
+            bg=BG,
+            fg=SECONDARY_FG,
+            font=("Segoe UI", 8),
+            anchor="w",
+        )
+        self.user_clock_label.pack(fill="x", padx=26, pady=(14, 0))
+        self._tick_clock()
+
         # ── Header ────────────────────────────────────────────────────
         header = tk.Frame(self, bg=BG)
-        header.pack(fill="x", padx=24, pady=(28, 4))
+        header.pack(fill="x", padx=24, pady=(2, 4))
 
         tk.Label(header, text="Invoice Processor", bg=BG, fg=TEXT,
                  font=("Segoe UI", 18, "bold"), anchor="w").pack(side="left")
@@ -323,36 +607,55 @@ class MainScreen(tk.Frame):
 
         self.drop_label = tk.Label(
             inner,
-            text="Drag & drop a PDF here" if DND_AVAILABLE else "Select a PDF below",
+            text="Drag & drop your invoice PDF here" if DND_AVAILABLE else "Select your invoice PDF below",
             bg=PANEL, fg=TEXT, font=("Segoe UI", 11, "bold"),
         )
         self.drop_label.pack(pady=(6, 2))
 
-        tk.Label(inner, text="or use the Browse button below",
+        tk.Label(inner, text="or click anywhere here to browse for the invoice file",
                  bg=PANEL, fg=TEXT_MUTED, font=("Segoe UI", 9)).pack()
+
+        tk.Label(inner, text="Accepts the invoice PDF you received from Martin's Distribution.",
+                 bg=PANEL, fg=TEXT_MUTED, font=("Segoe UI", 8)).pack(pady=(4, 0))
 
         self.drop_zone.bind("<Button-1>", lambda e: self._browse())
         for child in inner.winfo_children():
             child.bind("<Button-1>", lambda e: self._browse())
 
-        # ── Path entry ────────────────────────────────────────────────
-        section_label(self, "File path")
+        # ── Selected invoice ──────────────────────────────────────────
+        section_label(self, "Selected invoice:")
 
-        entry_row = tk.Frame(self, bg=BG)
-        entry_row.pack(fill="x", padx=24, pady=(2, 16))
+        selected_row = tk.Frame(self, bg=BG)
+        selected_row.pack(fill="x", padx=24, pady=(2, 0))
 
+        selected_box = tk.Frame(selected_row, bg=PANEL, relief="flat",
+                                highlightbackground=BORDER, highlightthickness=1)
+        selected_box.pack(fill="x", expand=True)
+
+        self.filename_label = tk.Label(
+            selected_box, text="No file selected yet",
+            bg=PANEL, fg=TEXT, font=("Segoe UI", 10, "bold"),
+            anchor="w", justify="left",
+        )
+        self.filename_label.pack(fill="x", padx=10, pady=(8, 0))
+
+        self.path_label = tk.Label(
+            selected_box, text="",
+            bg=PANEL, fg=TEXT_MUTED, font=("Segoe UI", 8),
+            anchor="w", justify="left", wraplength=380,
+        )
+        self.path_label.pack(fill="x", padx=10, pady=(0, 8))
+
+        # path_var holds the actual full path used internally by the pipeline
         self.path_var = tk.StringVar()
-        tk.Entry(entry_row, textvariable=self.path_var,
-                 font=("Segoe UI", 10), bg=PANEL, fg=TEXT,
-                 insertbackground=TEXT, relief="flat",
-                 highlightbackground=BORDER, highlightthickness=1
-                 ).pack(side="left", fill="x", expand=True, ipady=6, padx=(0, 8))
 
-        tk.Button(entry_row, text="Browse…", command=self._browse,
-                  font=("Segoe UI", 9), bg=PANEL, fg=ACCENT,
-                  activebackground=DROP_HOVER, activeforeground=ACCENT_DARK,
-                  relief="flat", highlightbackground=BORDER, highlightthickness=1,
-                  cursor="hand2", padx=10, pady=6).pack(side="right")
+        # ── Output folder preview ─────────────────────────────────────
+        self.output_preview_label = tk.Label(
+            self, text="", bg=BG, fg=TEXT_MUTED,
+            font=("Segoe UI", 9), anchor="w", justify="left", wraplength=490,
+        )
+        self.output_preview_label.pack(fill="x", padx=24, pady=(12, 12))
+        self._refresh_output_preview()
 
         # ── Process button ────────────────────────────────────────────
         self.process_btn = tk.Button(self, text="Process Invoice",
@@ -361,33 +664,61 @@ class MainScreen(tk.Frame):
                                      bg=ACCENT, fg="white",
                                      activebackground=ACCENT_DARK, activeforeground="white",
                                      relief="flat", cursor="hand2", pady=10)
-        self.process_btn.pack(fill="x", padx=24, pady=(0, 20))
+        self.process_btn.pack(fill="x", padx=24, pady=(0, 24))
 
-        # ── Status ────────────────────────────────────────────────────
-        self.status_frame = tk.Frame(self, bg=BG)
-        self.status_frame.pack(fill="x", padx=24, pady=(0, 24))
+    # ── User / clock ──────────────────────────────────────────────────
 
-        self.status_label = tk.Label(self.status_frame, text="", bg=BG, fg=TEXT_MUTED,
-                                     font=("Segoe UI", 9), anchor="w",
-                                     justify="left", wraplength=490)
-        self.status_label.pack(fill="x")
+    def _status_bar_text(self) -> str:
+        now = datetime.datetime.now().strftime("%d %b %Y  %H:%M")
+        return f"Logged in as:  {CURRENT_USER}  \u2022  {now}"
 
-    # ── Drag-and-drop ─────────────────────────────────────────────────
+    def _tick_clock(self):
+        """Update the clock label every 60 seconds."""
+        self.user_clock_label.config(text=self._status_bar_text())
+        self.after(60_000, self._tick_clock)
+
+    # ── Output preview ────────────────────────────────────────────────
+
+    def _refresh_output_preview(self):
+        output_folder = self.config.get("output_folder", "")
+        self.output_preview_label.configure(
+            text=f"Your processed invoice will be saved to: {output_folder}"
+        )
+
+    # ── Selected invoice display ──────────────────────────────────────
+
+    def _update_selected_display(self, path: str):
+        self.path_var.set(path)
+
+        if path:
+            self.filename_label.configure(text=os.path.basename(path), fg=TEXT)
+            self.path_label.configure(text=path, fg=TEXT_MUTED)
+        else:
+            self.filename_label.configure(text="No file selected yet", fg=TEXT)
+            self.path_label.configure(text="", fg=TEXT_MUTED)
+
+    def _mark_invalid_selection(self, reason: str):
+        """Flag the currently selected file as invalid, in place, with a reason."""
+        self.filename_label.configure(fg=ERROR_FG)
+        self.path_label.configure(text=reason, fg=ERROR_FG)
+
+    # ── Drag-and-drop ──────────────────────────────────────────────────
 
     def _on_drag_enter(self, event):
         self.drop_zone.configure(bg=DROP_HOVER, highlightbackground=ACCENT)
-        self.drop_label.configure(bg=DROP_HOVER, text="Drop to select")
+        self.drop_label.configure(bg=DROP_HOVER, text="Release to select this file")
 
     def _on_drag_leave(self, event):
         self.drop_zone.configure(bg=PANEL, highlightbackground=BORDER)
-        self.drop_label.configure(bg=PANEL, text="Drag & drop a PDF here")
+        self.drop_label.configure(bg=PANEL, text="Drag & drop your invoice PDF here")
 
     def _on_drop(self, event):
         self.drop_zone.configure(bg=PANEL, highlightbackground=BORDER)
-        self.drop_label.configure(bg=PANEL, text="Drag & drop a PDF here")
-        self.path_var.set(event.data.strip().strip("{}"))
+        self.drop_label.configure(bg=PANEL, text="Drag & drop your invoice PDF here")
+        dropped_path = event.data.strip().strip("{}")
+        self._update_selected_display(dropped_path)
 
-    # ── File browser ──────────────────────────────────────────────────
+    # ── File browser ───────────────────────────────────────────────────
 
     def _browse(self):
         initial = self.config.get("input_folder") or "/"
@@ -397,7 +728,7 @@ class MainScreen(tk.Frame):
             filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
         )
         if path:
-            self.path_var.set(path)
+            self._update_selected_display(path)
 
     # ── Config ────────────────────────────────────────────────────────
 
@@ -413,37 +744,40 @@ class MainScreen(tk.Frame):
 
     def _start_processing(self):
         pdf_path = self.path_var.get().strip()
+
         if not pdf_path:
-            self._set_status("Please select or enter a PDF path first.", is_error=True)
+            messagebox.showwarning(
+                "No invoice selected",
+                "Please drag in or browse for an invoice before processing.",
+                parent=self.parent,
+            )
             return
 
-        self.process_btn.configure(state="disabled", text="Processing…", bg="#93C5FD")
-        self._set_status("Starting…", is_error=False)
+        if not os.path.isfile(pdf_path):
+            messagebox.showwarning(
+                "File not found",
+                "We couldn't find that file. Please select it again using the "
+                "Browse button or drag it in.",
+                parent=self.parent,
+            )
+            self._mark_invalid_selection("This file couldn't be found. Please choose it again.")
+            return
+
+        if not pdf_path.lower().endswith(".pdf"):
+            messagebox.showwarning(
+                "Wrong file type",
+                "Please choose a PDF file — this looks like a different file type.",
+                parent=self.parent,
+            )
+            self._mark_invalid_selection("This file type isn't supported — please choose a PDF.")
+            return
 
         output_folder = self.config.get("output_folder", "pdf_output")
 
-        threading.Thread(
-            target=run_pipeline,
-            args=(pdf_path, output_folder, self._thread_safe_status),
-            daemon=True,
-        ).start()
-
-    def _thread_safe_status(self, message, is_error, success=False):
-        self.parent.after(0, self._set_status, message, is_error, success)
-
-    def _set_status(self, message, is_error, success=False):
-        if success:
-            bg, fg = SUCCESS_BG, SUCCESS_FG
-        elif is_error:
-            bg, fg = ERROR_BG, ERROR_FG
-        else:
-            bg, fg = BG, TEXT_MUTED
-
-        self.status_frame.configure(bg=bg)
-        self.status_label.configure(text=message, bg=bg, fg=fg)
-
-        if success or is_error:
-            self.process_btn.configure(state="normal", text="Process Invoice", bg=ACCENT)
+        self.process_btn.configure(state="disabled", text="Processing…", bg="#93C5FD")
+        dialog = ProcessingDialog(self.parent, pdf_path, output_folder)
+        self.parent.wait_window(dialog)
+        self.process_btn.configure(state="normal", text="Process Invoice", bg=ACCENT)
 
 
 # ---------------------------------------------------------------------------
@@ -457,10 +791,24 @@ class App:
         self.root.title("Invoice Processor")
         self.root.configure(bg=BG)
         self.root.resizable(False, False)
-        center_window(self.root, 540, 580)
+        center_window(self.root, 540, 540)
         bring_to_front(self.root)
         self.root.iconbitmap(resource_path("Martins-Distribution_RGB.ico"))
+
+        # ── Config migration ──────────────────────────────────────────
+        # Existing installs won't have "log_path" in their config.json
+        # (it was only added this session).  If the key is absent, write the
+        # placeholder in now so the file is always up to date after first run.
         config = load_config()
+        if "log_path" not in config:
+            config["log_path"] = "\\\\SERVER\\MDIPLogs\\app.log"
+            # Only save if there's already a real config worth preserving —
+            # first-launch configs are saved by ConfigScreen._save() instead.
+            if is_config_valid(config):
+                save_config(config)
+
+        # Initialise logging before anything else runs
+        setup_logging(config.get("log_path"))
 
         if not is_config_valid(config):
             # First launch — hide the main window until config is saved
