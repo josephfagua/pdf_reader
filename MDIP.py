@@ -427,12 +427,16 @@ class ProcessingDialog(tk.Toplevel):
     WIDTH = 420
     HEIGHT = 260
 
-    def __init__(self, parent, pdf_path: str, output_folder: str):
+    def __init__(self, parent, pdf_path: str, output_folder: str, explorer_hwnd: int | None = None):
         super().__init__(parent)
         self.parent = parent
         self.is_finished = False
         self.success = False
         self.output_path = None
+        self._output_folder = os.path.normpath(output_folder)
+        # Incoming hwnd from MainScreen — the Explorer window from the last run.
+        # Outgoing: updated after this run so MainScreen can store the new value.
+        self.explorer_hwnd: int | None = explorer_hwnd
 
         self.title("Processing Invoice")
         self.configure(bg=BG)
@@ -493,24 +497,39 @@ class ProcessingDialog(tk.Toplevel):
 
     def _on_close(self):
         if self.success and self.output_path:
-            self._reveal_output_file(self.output_path)
+            # Check if the Explorer window from the previous run is still alive.
+            # IsWindow() returns 0 if the handle is invalid or the window was closed.
+            hwnd_still_alive = (
+                self.explorer_hwnd is not None
+                and ctypes.windll.user32.IsWindow(self.explorer_hwnd)
+            )
+            if not hwnd_still_alive:
+                # No live Explorer window — open one and capture its handle.
+                self.explorer_hwnd = self._reveal_output_file(self.output_path)
         self.destroy()
 
-    def _reveal_output_file(self, path: str):
-        """Open Explorer with the finished file highlighted, so the user can
-        immediately see and act on it without hunting for it manually."""
+    def _reveal_output_file(self, path: str) -> int | None:
+        """
+        Open Explorer with the finished file highlighted.
+        Returns the hwnd of the Explorer window that was opened, or None on failure.
+        The handle is stored so subsequent runs can check if it's still alive.
+        """
         try:
-            # Windows normally prevents background processes from stealing
-            # focus, which is why Explorer can open behind other windows.
-            # Calling this just before launching it allows the next window
-            # that requests focus to actually receive it.
             ASFW_ANY = -1
             ctypes.windll.user32.AllowSetForegroundWindow(ASFW_ANY)
             subprocess.Popen(f'explorer /select,"{os.path.normpath(path)}"')
+
+            # Explorer takes a moment to open. Retry FindWindowW for up to
+            # ~1 second (20 attempts × 50 ms) until the window appears.
+            # We match on class name "CabinetWClass" to avoid false positives.
+            for _ in range(20):
+                time.sleep(0.05)
+                hwnd = ctypes.windll.user32.FindWindowW("CabinetWClass", None)
+                if hwnd:
+                    return hwnd
         except Exception:
-            # Never let a failure here block the dialog from closing —
-            # worst case the user just doesn't get the folder popped open.
             pass
+        return None
 
     def _thread_safe_status(self, header, detail, step, is_error, success=False, output_path=None):
         self.parent.after(0, self._set_status, header, detail, step, is_error, success, output_path)
@@ -550,6 +569,10 @@ class MainScreen(tk.Frame):
         super().__init__(parent, bg=BG)
         self.parent = parent
         self.config = config
+        # Handle of the Explorer window we last opened. Persists across
+        # multiple processing runs so we can check if it's still alive.
+        # None means no Explorer window has been opened yet this session.
+        self._explorer_hwnd: int | None = None
         self._build_ui()
 
         if DND_AVAILABLE:
@@ -775,8 +798,17 @@ class MainScreen(tk.Frame):
         output_folder = self.config.get("output_folder", "pdf_output")
 
         self.process_btn.configure(state="disabled", text="Processing…", bg="#93C5FD")
-        dialog = ProcessingDialog(self.parent, pdf_path, output_folder)
+        dialog = ProcessingDialog(
+            self.parent,
+            pdf_path,
+            output_folder,
+            explorer_hwnd=self._explorer_hwnd,
+        )
         self.parent.wait_window(dialog)
+        # Grab the updated hwnd back from the dialog — may be the same handle
+        # as before (Explorer still open, nothing launched) or a new one
+        # (Explorer was opened this run).
+        self._explorer_hwnd = dialog.explorer_hwnd
         self.process_btn.configure(state="normal", text="Process Invoice", bg=ACCENT)
 
 
