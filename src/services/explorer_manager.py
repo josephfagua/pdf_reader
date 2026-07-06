@@ -13,7 +13,6 @@ No other module should call explorer.exe directly.
 """
 
 from __future__ import annotations
-
 import os
 import pythoncom
 import win32com.client
