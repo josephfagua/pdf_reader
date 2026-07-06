@@ -670,7 +670,7 @@ class MainScreen(tk.Frame):
 
     def _status_bar_text(self) -> str:
         now = datetime.datetime.now().strftime("%d %b %Y  %H:%M")
-        return f"Logged in as:  {CURRENT_USER}  \u2022  {now}"
+        return f"Logged in as:  {CURRENT_USER}     \u2022     {now}"
 
     def _tick_clock(self):
         """Update the clock label every 60 seconds."""
@@ -785,7 +785,23 @@ class MainScreen(tk.Frame):
 # ---------------------------------------------------------------------------
 
 class App:
+    # Unique name for the Windows mutex — must not collide with any other app.
+    _MUTEX_NAME = "MDInvoiceProcessor_SingleInstance"
+
     def __init__(self):
+        # ── Single-instance guard ─────────────────────────────────────
+        # Create a named mutex. If it already exists, another instance is
+        # running — focus that window and exit this one silently.
+        self._mutex = ctypes.windll.kernel32.CreateMutexW(None, False, self._MUTEX_NAME)
+        if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            # Try to find and restore the existing window by its title.
+            hwnd = ctypes.windll.user32.FindWindowW(None, "Invoice Processor")
+            if hwnd:
+                # SW_RESTORE (9) un-minimises the window if it was minimised.
+                ctypes.windll.user32.ShowWindow(hwnd, 9)
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+            sys.exit(0)
+
         root = TkinterDnD.Tk() if DND_AVAILABLE else tk.Tk()
         self.root = root
         self.root.title("Invoice Processor")
