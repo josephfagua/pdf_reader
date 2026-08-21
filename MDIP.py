@@ -1045,7 +1045,8 @@ class MainScreen(tk.Frame):
         selected_row.pack(fill="x", padx=24, pady=(2, 0))
 
         selected_box = tk.Frame(selected_row, bg=PANEL, relief="flat",
-                                highlightbackground=BORDER, highlightthickness=1)
+                                highlightbackground=BORDER, highlightthickness=1, height=90)
+        selected_box.pack_propagate(False)
         selected_box.pack(fill="x", expand=True)
 
         self.filename_label = tk.Label(
@@ -1055,12 +1056,10 @@ class MainScreen(tk.Frame):
         )
         self.filename_label.pack(fill="x", padx=10, pady=(8, 0))
 
-        self.path_label = tk.Label(
-            selected_box, text="",
-            bg=PANEL, fg=TEXT_MUTED, font=("Segoe UI", 8),
-            anchor="w", justify="left", wraplength=380,
+        self.path_label = tk.Label(selected_box,text="",bg=PANEL,fg=TEXT_MUTED,
+                                font=("Segoe UI", 8),anchor="nw",justify="left",wraplength=450,
         )
-        self.path_label.pack(fill="x", padx=10, pady=(0, 8))
+        self.path_label.pack(fill="both", expand=True, padx=10, pady=(0, 8))
 
         # selected_files holds the full paths used internally by the batch pipeline.
         self.selected_files = []
@@ -1111,10 +1110,13 @@ class MainScreen(tk.Frame):
 
         self.selected_files = list(paths)
 
+        # Update process button text based on selection count.
         self.process_btn.configure(
-            text="Process Invoice"
-            if len(self.selected_files) == 1
-            else "Process Invoices"
+            text=(
+                "Process Invoice"
+                if len(self.selected_files) == 1
+                else "Process Invoices"
+            )
         )
 
         if not self.selected_files:
@@ -1122,21 +1124,29 @@ class MainScreen(tk.Frame):
                 text="No invoices selected yet",
                 fg=TEXT,
             )
-            self.path_label.configure(text="", fg=TEXT_MUTED)
-            return
-
-        if len(self.selected_files) == 1:
-            path = self.selected_files[0]
-            self.filename_label.configure(
-                text=os.path.basename(path),
-                fg=TEXT,
-            )
             self.path_label.configure(
-                text=path,
+                text="",
                 fg=TEXT_MUTED,
             )
             return
 
+        # Single invoice.
+        if len(self.selected_files) == 1:
+            path = self.selected_files[0]
+
+            self.filename_label.configure(
+                text=os.path.basename(path),
+                fg=TEXT,
+            )
+
+            self.path_label.configure(
+                text=path,
+                fg=TEXT_MUTED,
+            )
+
+            return
+
+        # Multiple invoices.
         names = [
             os.path.basename(path)
             for path in self.selected_files[:6]
@@ -1145,12 +1155,15 @@ class MainScreen(tk.Frame):
         display = "\n".join(names)
 
         if len(self.selected_files) > 6:
-            display += f"\n…and {len(self.selected_files) - 6} more"
+            display += (
+                f"\n…and {len(self.selected_files) - 6} more"
+            )
 
         self.filename_label.configure(
             text=f"{len(self.selected_files)} invoices selected",
             fg=TEXT,
         )
+
         self.path_label.configure(
             text=display,
             fg=TEXT_MUTED,

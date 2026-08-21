@@ -14,7 +14,12 @@ import re
 from src.models import OrderDetails
 
 
-VELVET_LOCATIONS = ("NORTH HILLS", "SOUTHEND", "PARK RD")
+VELVET_LOCATIONS = {
+    "NORTH HILLS": "Velvet Taco — North Hills",
+    "SOUTHEND": "Velvet Taco — Southend",
+    "PARK RD": "Velvet Taco — Park Rd",
+    "PARK ROAD": "Velvet Taco — Park Rd",
+}
 VALID_VELVET_PO = re.compile(r"^VO\d{6}$", re.IGNORECASE)
 
 
@@ -32,6 +37,7 @@ class InvoiceValidationResult:
 
 def identify_client(customer_name: str | None) -> str | None:
     """Identify one of the currently supported client locations."""
+
     if not customer_name:
         return None
 
@@ -41,9 +47,10 @@ def identify_client(customer_name: str | None) -> str | None:
         return "Taco Bamba"
 
     if "VELVET TACO" in normalized:
-        for location in VELVET_LOCATIONS:
+        for location, client_name in VELVET_LOCATIONS.items():
             if location in normalized:
-                return f"Velvet Taco — {location.title()}"
+                return client_name
+
         return "Velvet Taco — Unknown Location"
 
     return None
