@@ -22,7 +22,6 @@ class OrderDetails(BaseModel):
     @field_validator("total_cost", mode="before")
     @classmethod
     def strip_commas(cls, value):
-        """Allow '3,614.00' style strings to coerce cleanly into a float."""
         if isinstance(value, str):
             return value.replace(",", "")
         return value

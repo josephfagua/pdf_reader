@@ -11,7 +11,6 @@ Requires:
 
 import os
 import time
-from src.services.explorer_manager import explorer_manager
 import ctypes
 from pathlib import Path
 import json
@@ -29,6 +28,8 @@ except ImportError:
     DND_AVAILABLE = False
 
 from src.main import extract_text, refine_data, parse_items, extract_order_details, export_items_csv
+from src.validation import validate_invoice
+from src.services.explorer_manager import explorer_manager
 from src.logging_config import setup_logging, get_logger, log_event
 
 
@@ -166,7 +167,12 @@ _logger = get_logger("mdip")
 CURRENT_MACHINE = os.environ.get("COMPUTERNAME", "unknown")
 
 
-def run_pipeline(pdf_path: str, output_folder: str, status_callback) -> None:
+def run_pipeline(
+    pdf_path: str,
+    output_folder: str,
+    status_callback,
+    po_exception_approved: bool = False,
+) -> None:
     """
     Runs the full pipeline in a background thread, reporting progress via
     status_callback(header, detail, step, is_error, success, output_path).
@@ -205,6 +211,7 @@ def run_pipeline(pdf_path: str, output_folder: str, status_callback) -> None:
 
     # Collect file metadata before processing starts.
     invoice_filename = os.path.basename(pdf_path)
+    invoice_number_for_log = "UNKNOWN"
     try:
         file_size_kb = round(os.path.getsize(pdf_path) / 1024, 1)
     except OSError:
@@ -229,11 +236,16 @@ def run_pipeline(pdf_path: str, output_folder: str, status_callback) -> None:
             "items":         parse_items(cleaned_text),
         }
         item_count = len(order_data["items"])
+        invoice_number_for_log = order_data["order_details"].invoice_number or "UNKNOWN"
         status_callback("Finding your items and order info…", "", step=4, is_error=False)
         time.sleep(STEP_DELAY)
 
         os.makedirs(output_folder, exist_ok=True)
-        output_path = export_items_csv(order_data, output_folder)
+        output_path = export_items_csv(
+            order_data,
+            output_folder,
+            po_exception_approved=po_exception_approved,
+        )
         status_callback("Saving your file…", "", step=5, is_error=False)
         time.sleep(STEP_DELAY)
 
@@ -252,7 +264,7 @@ def run_pipeline(pdf_path: str, output_folder: str, status_callback) -> None:
             _logger,
             user=CURRENT_USER,
             machine=CURRENT_MACHINE,
-            invoice_file=invoice_filename,
+            invoice_number=invoice_number_for_log,
             file_size_kb=file_size_kb,
             duration_s=duration_s,
             item_count=item_count,
@@ -266,7 +278,7 @@ def run_pipeline(pdf_path: str, output_folder: str, status_callback) -> None:
             _logger,
             user=CURRENT_USER,
             machine=CURRENT_MACHINE,
-            invoice_file=invoice_filename,
+            invoice_number=invoice_number_for_log,
             file_size_kb=file_size_kb,
             duration_s=duration_s,
             item_count=0,
@@ -418,37 +430,49 @@ class ConfigScreen(tk.Toplevel):
 
 class ProcessingDialog(tk.Toplevel):
     """
-    Modal dialog shown while an invoice is processed. Owns the progress bar
-    and status messages that used to live on MainScreen. Starts the pipeline
-    immediately on open. The window cannot be closed (X button is blocked)
-    until processing reaches a final state (success or error).
+    Modal dialog shown while a batch of invoices is processed.
+
+    Each invoice is still processed by run_pipeline(), which remains
+    responsible for one invoice. This dialog coordinates the batch and
+    reports overall progress to the user.
     """
 
-    WIDTH = 420
-    HEIGHT = 260
+    WIDTH = 460
+    HEIGHT = 280
 
-    def __init__(self, parent, pdf_path: str, output_folder: str):
+    def __init__(
+        self,
+        parent,
+        pdf_paths: list[str],
+        output_folder: str,
+        po_exceptions: set[str] | None = None,
+    ):
         super().__init__(parent)
+
         self.parent = parent
+        self.pdf_paths = list(pdf_paths)
+        self._output_folder = os.path.normpath(output_folder)
+        self.po_exceptions = po_exceptions or set()
+
         self.is_finished = False
         self.success = False
-        self.output_path = None
-        self.title("Processing Invoice")
+        self.output_paths: list[str] = []
+        self.error_message = ""
+
+        self.title("Processing Invoices")
         self.configure(bg=BG)
         self.resizable(False, False)
         center_over(self, parent, self.WIDTH, self.HEIGHT)
         bring_to_front(self)
         self.iconbitmap(resource_path("Martins-Distribution_RGB.ico"))
 
-        # Block the X button until processing is finished
         self.protocol("WM_DELETE_WINDOW", self._block_close)
         self.grab_set()
 
         self._build_ui()
 
         threading.Thread(
-            target=run_pipeline,
-            args=(pdf_path, output_folder, self._thread_safe_status),
+            target=self._process_batch,
             daemon=True,
         ).start()
 
@@ -456,73 +480,479 @@ class ProcessingDialog(tk.Toplevel):
         title_frame = tk.Frame(self, bg=BG)
         title_frame.pack(fill="x", padx=24, pady=(24, 8))
 
-        self.header_label = tk.Label(title_frame, text="Getting started…", bg=BG, fg=TEXT,
-                                     font=("Segoe UI", 13, "bold"), anchor="w",
-                                     justify="left", wraplength=370)
+        self.header_label = tk.Label(
+            title_frame,
+            text="Preparing invoices…",
+            bg=BG,
+            fg=TEXT,
+            font=("Segoe UI", 13, "bold"),
+            anchor="w",
+            justify="left",
+            wraplength=400,
+        )
         self.header_label.pack(side="left")
 
         self.progress_bar = ttk.Progressbar(
-            self, mode="determinate", maximum=TOTAL_STEPS, value=0
+            self,
+            mode="determinate",
+            maximum=max(len(self.pdf_paths) * TOTAL_STEPS, 1),
+            value=0,
         )
         self.progress_bar.pack(fill="x", padx=24, pady=(8, 12))
 
         self.status_frame = tk.Frame(self, bg=BG)
         self.status_frame.pack(fill="x", padx=24, pady=(0, 16))
 
-        # Smaller detail line — empty during normal steps, used only to carry
-        # the full success/error message alongside the short header above.
-        self.status_label = tk.Label(self.status_frame, text="",
-                                     bg=BG, fg=TEXT_MUTED, font=("Segoe UI", 9),
-                                     anchor="w", justify="left", wraplength=370)
+        self.status_label = tk.Label(
+            self.status_frame,
+            text="",
+            bg=BG,
+            fg=TEXT_MUTED,
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+            wraplength=400,
+        )
         self.status_label.pack(fill="x")
 
-        self.close_btn = tk.Button(self, text="Close", command=self._on_close,
-                                   font=("Segoe UI", 10, "bold"),
-                                   bg="#93C5FD", fg="white",
-                                   activebackground=ACCENT_DARK, activeforeground="white",
-                                   relief="flat", cursor="hand2", pady=8,
-                                   state="disabled")
+        self.close_btn = tk.Button(
+            self,
+            text="Close",
+            command=self._on_close,
+            font=("Segoe UI", 10, "bold"),
+            bg="#93C5FD",
+            fg="white",
+            activebackground=ACCENT_DARK,
+            activeforeground="white",
+            relief="flat",
+            cursor="hand2",
+            pady=8,
+            state="disabled",
+        )
         self.close_btn.pack(fill="x", padx=24, pady=(0, 20))
 
     def _block_close(self):
-        """Ignore the X button while processing is still in progress."""
         if self.is_finished:
             self._on_close()
-        # else: do nothing — processing must reach a final state first
 
-    def _on_close(self):
-        if self.success and self.output_path:
-            explorer_manager.reveal(self.output_path)
+    def _process_batch(self):
+        total = len(self.pdf_paths)
 
-        self.destroy()
+        for index, pdf_path in enumerate(self.pdf_paths, start=1):
+            invoice_name = os.path.basename(pdf_path)
 
-    def _thread_safe_status(self, header, detail, step, is_error, success=False, output_path=None):
-        self.parent.after(0, self._set_status, header, detail, step, is_error, success, output_path)
+            def callback(
+                header,
+                detail,
+                step,
+                is_error,
+                success=False,
+                output_path=None,
+                current_index=index,
+                total_count=total,
+                current_name=invoice_name,
+            ):
+                if output_path:
+                    self.output_paths.append(output_path)
 
-    def _set_status(self, header, detail, step, is_error, success=False, output_path=None):
-        # step=None means "leave the progress bar exactly where it is" —
-        # used on error, so the bar freezes at the point of failure.
+                # A successful invoice is an intermediate result during a
+                # batch, so it must not unlock the Close button yet.
+                if success:
+                    self._thread_safe_status(
+                        f"Invoice {current_index} of {total_count} complete",
+                        detail,
+                        step,
+                        False,
+                        False,
+                        None,
+                    )
+                    return
+
+                self._thread_safe_status(
+                    f"Invoice {current_index} of {total_count}: {header}",
+                    detail,
+                    step,
+                    is_error,
+                    False,
+                    None,
+                )
+
+            before_count = len(self.output_paths)
+
+            run_pipeline(
+                pdf_path,
+                self._output_folder,
+                callback,
+                po_exception_approved=pdf_path in self.po_exceptions,
+            )
+
+            # If this invoice did not create an output file, its pipeline
+            # encountered an error and the batch should stop.
+            if len(self.output_paths) == before_count:
+                self.parent.after(
+                    0,
+                    self._finish_batch,
+                    False,
+                    f"Processing stopped while handling {invoice_name}.",
+                )
+                return
+
+        self.parent.after(0, self._finish_batch, True, "")
+
+    def _finish_batch(self, success: bool, error_message: str):
+        self.is_finished = True
+        self.success = success
+        self.error_message = error_message
+
+        if success:
+            self.header_label.configure(
+                text=f"Batch complete — {len(self.output_paths)} invoice(s)",
+                fg=SUCCESS_FG,
+            )
+            self.status_frame.configure(bg=SUCCESS_BG)
+            self.status_label.configure(
+                text="All selected invoices were processed successfully.",
+                bg=SUCCESS_BG,
+                fg=SUCCESS_FG,
+            )
+            self.progress_bar["value"] = len(self.pdf_paths) * TOTAL_STEPS
+        else:
+            self.header_label.configure(
+                text="Batch processing stopped",
+                fg=ERROR_FG,
+            )
+            self.status_frame.configure(bg=ERROR_BG)
+            self.status_label.configure(
+                text=error_message,
+                bg=ERROR_BG,
+                fg=ERROR_FG,
+            )
+
+        self.close_btn.configure(state="normal", bg=ACCENT)
+
+    def _thread_safe_status(
+        self,
+        header,
+        detail,
+        step,
+        is_error,
+        success=False,
+        output_path=None,
+    ):
+        # Each invoice owns TOTAL_STEPS progress units.
+        # The current invoice number is derived from the header's prefix.
+        try:
+            current_index = int(header.split()[1])
+        except (ValueError, IndexError):
+            current_index = 1
+
+        absolute_step = (
+            max(current_index - 1, 0) * TOTAL_STEPS
+            + (step or 0)
+        )
+
+        self.parent.after(
+            0,
+            self._set_status,
+            header,
+            detail,
+            absolute_step,
+            is_error,
+            success,
+            output_path,
+        )
+
+    def _set_status(
+        self,
+        header,
+        detail,
+        step,
+        is_error,
+        success=False,
+        output_path=None,
+    ):
         if step is not None:
             self.progress_bar["value"] = step
 
-        if success:
-            bg, fg = SUCCESS_BG, SUCCESS_FG
-        elif is_error:
+        bg, fg = BG, TEXT_MUTED
+
+        if is_error:
             bg, fg = ERROR_BG, ERROR_FG
-        else:
-            bg, fg = BG, TEXT_MUTED
+        elif success:
+            bg, fg = SUCCESS_BG, SUCCESS_FG
 
-        # Header always shows the short, prominent status; detail line below
-        # only carries text on the final success/error states.
-        self.header_label.configure(text=header, fg=fg if (success or is_error) else TEXT)
+        self.header_label.configure(
+            text=header,
+            fg=fg if (success or is_error) else TEXT,
+        )
         self.status_frame.configure(bg=bg)
-        self.status_label.configure(text=detail, bg=bg, fg=fg)
+        self.status_label.configure(
+            text=detail,
+            bg=bg,
+            fg=fg,
+        )
 
-        if success or is_error:
-            self.is_finished = True
-            self.success = success
-            self.output_path = output_path
-            self.close_btn.configure(state="normal", bg=ACCENT)
+    def _on_close(self):
+        if self.success and self.output_paths:
+            explorer_manager.reveal(self.output_paths[-1])
+
+        self.destroy()
+
+
+class ValidationDialog(tk.Toplevel):
+    """
+    Scan all selected invoices before processing.
+
+    Blank Customer PO values, and Velvet Taco "Verbal" values, may be explicitly
+    approved as office-created second-delivery exceptions. Other invalid values
+    cannot be bypassed.
+    """
+
+    WIDTH = 620
+    HEIGHT = 430
+
+    def __init__(self, parent, pdf_paths: list[str]):
+        super().__init__(parent)
+
+        self.parent = parent
+        self.pdf_paths = list(pdf_paths)
+        self.results = []
+        self.approved_exceptions: set[str] = set()
+        self.validation_passed = False
+
+        self.title("Invoice Validation")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        center_over(self, parent, self.WIDTH, self.HEIGHT)
+        bring_to_front(self)
+        self.iconbitmap(resource_path("Martins-Distribution_RGB.ico"))
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        self._build_ui()
+
+        threading.Thread(
+            target=self._scan_invoices,
+            daemon=True,
+        ).start()
+
+    def _build_ui(self):
+        tk.Label(
+            self,
+            text="Checking selected invoices…",
+            bg=BG,
+            fg=TEXT,
+            font=("Segoe UI", 14, "bold"),
+            anchor="w",
+        ).pack(fill="x", padx=24, pady=(24, 8))
+
+        self.progress_label = tk.Label(
+            self,
+            text="Preparing scan…",
+            bg=BG,
+            fg=TEXT_MUTED,
+            font=("Segoe UI", 9),
+            anchor="w",
+        )
+        self.progress_label.pack(fill="x", padx=24, pady=(0, 10))
+
+        self.results_text = tk.Text(
+            self,
+            height=15,
+            width=72,
+            bg=PANEL,
+            fg=TEXT,
+            relief="flat",
+            highlightbackground=BORDER,
+            highlightthickness=1,
+            state="disabled",
+            wrap="word",
+        )
+        self.results_text.pack(fill="both", expand=True, padx=24, pady=(0, 16))
+
+        self.action_btn = tk.Button(
+            self,
+            text="Checking…",
+            command=self._review_results,
+            state="disabled",
+            font=("Segoe UI", 10, "bold"),
+            bg=ACCENT,
+            fg="white",
+            activebackground=ACCENT_DARK,
+            relief="flat",
+            cursor="hand2",
+            pady=8,
+        )
+        self.action_btn.pack(fill="x", padx=24, pady=(0, 10))
+
+        self.close_review_btn = tk.Button(
+            self,
+            text="Close Review",
+            command=self._cancel,
+            font=("Segoe UI", 9),
+            bg=PANEL,
+            fg=TEXT_MUTED,
+            activebackground=BORDER,
+            activeforeground=TEXT,
+            relief="flat",
+            cursor="hand2",
+        )
+        self.close_review_btn.pack(fill="x", padx=24, pady=(0, 20))
+
+    def _scan_invoices(self):
+        for index, pdf_path in enumerate(self.pdf_paths, start=1):
+            self.parent.after(
+                0,
+                lambda i=index, total=len(self.pdf_paths):
+                    self.progress_label.configure(
+                        text=f"Scanning invoice {i} of {total}…"
+                    ),
+            )
+
+            try:
+                raw_text = extract_text(pdf_path)
+                cleaned_text = refine_data(raw_text)
+                order_details = extract_order_details(cleaned_text)
+
+                result = validate_invoice(pdf_path, order_details)
+                self.results.append(result)
+
+            except Exception as exc:
+                from types import SimpleNamespace
+
+                self.results.append(
+                    SimpleNamespace(
+                        invoice_path=pdf_path,
+                        invoice_number=None,
+                        customer_name=None,
+                        client=None,
+                        customer_po=None,
+                        valid=False,
+                        can_approve_exception=False,
+                        message=f"Could not scan invoice: {exc}",
+                    )
+                )
+
+        self.parent.after(0, self._display_results)
+
+    def _display_results(self):
+        invalid = [result for result in self.results if not result.valid]
+
+        self.results_text.configure(state="normal")
+        self.results_text.delete("1.0", "end")
+
+        if not invalid:
+            self.results_text.insert(
+                "end",
+                "✓ All selected invoices passed the required client validation.\n\n"
+                "The batch is ready to be processed.",
+            )
+            self.action_btn.configure(
+                text="Continue to Processing",
+                state="normal",
+            )
+        else:
+            self.results_text.insert(
+                "end",
+                f"{len(invalid)} invoice(s) require attention:\n\n",
+            )
+
+            for result in invalid:
+                self.results_text.insert(
+                    "end",
+                    f"Invoice: {result.invoice_number or 'UNKNOWN'}\n"
+                    f"Client: {result.client or 'UNKNOWN'}\n"
+                    f"File: {os.path.basename(result.invoice_path)}\n"
+                    f"Problem: {result.message}\n"
+                    f"Exception available: "
+                    f"{'Yes' if result.can_approve_exception else 'No'}\n\n",
+                )
+
+            exception_count = sum(
+                result.can_approve_exception for result in invalid
+            )
+
+            if exception_count:
+                self.action_btn.configure(
+                    text="Review PO Exceptions",
+                    state="normal",
+                )
+            else:
+                self.action_btn.configure(
+                    text="Cannot Continue",
+                    state="disabled",
+                )
+
+        self.results_text.configure(state="disabled")
+
+    def _review_results(self):
+        invalid = [result for result in self.results if not result.valid]
+
+        for result in invalid:
+            if not result.can_approve_exception:
+                continue
+
+            if not result.customer_po:
+                po_message = (
+                    "The Customer PO field is blank.\n\n"
+                )
+            else:
+                po_message = (
+                    f"The Customer PO field contains "
+                    f"'{result.customer_po}'.\n\n"
+                )
+
+            exception_message = (
+                f"Invoice: {result.invoice_number or 'UNKNOWN'}\n"
+                f"Client: {result.client}\n\n"
+                f"{po_message}"
+                "Approve this invoice as an office-created "
+                "second-delivery exception?\n\n"
+                "If approved, the outbound CSV Customer PO will be "
+                "set to 'Verbal'."
+            )
+
+            approved = messagebox.askyesno(
+                "Approve Customer PO Exception",
+                exception_message,
+                parent=self,
+            )
+
+            if approved:
+                self.approved_exceptions.add(result.invoice_path)
+
+        remaining = [
+            result
+            for result in invalid
+            if result.invoice_path not in self.approved_exceptions
+        ]
+
+        # A non-exception validation error can never be bypassed.
+        if any(not result.can_approve_exception for result in remaining):
+            messagebox.showerror(
+                "Invoices Require Correction",
+                "One or more invoices still contain validation errors. "
+                "Correct those invoices and scan the batch again.",
+                parent=self,
+            )
+            return
+
+        # An exception was available but the user did not approve it.
+        if remaining:
+            messagebox.showerror(
+                "Invoices Require Correction",
+                "One or more invoices were not approved for the exception. "
+                "Correct those invoices and scan the batch again.",
+                parent=self,
+            )
+            return
+
+        self.validation_passed = True
+        self.destroy()
+
+
+    def _cancel(self):
+        self.validation_passed = False
+        self.destroy()
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +964,8 @@ class MainScreen(tk.Frame):
         super().__init__(parent, bg=BG)
         self.parent = parent
         self.config = config
+        # All PDFs selected for the current processing session.
+        self.selected_files: list[str] = []
         self._build_ui()
 
         if DND_AVAILABLE:
@@ -607,7 +1039,7 @@ class MainScreen(tk.Frame):
             child.bind("<Button-1>", lambda e: self._browse())
 
         # ── Selected invoice ──────────────────────────────────────────
-        section_label(self, "Selected invoice:")
+        section_label(self, "Selected invoices:")
 
         selected_row = tk.Frame(self, bg=BG)
         selected_row.pack(fill="x", padx=24, pady=(2, 0))
@@ -617,7 +1049,7 @@ class MainScreen(tk.Frame):
         selected_box.pack(fill="x", expand=True)
 
         self.filename_label = tk.Label(
-            selected_box, text="No file selected yet",
+            selected_box, text="No invoices selected yet",
             bg=PANEL, fg=TEXT, font=("Segoe UI", 10, "bold"),
             anchor="w", justify="left",
         )
@@ -630,8 +1062,8 @@ class MainScreen(tk.Frame):
         )
         self.path_label.pack(fill="x", padx=10, pady=(0, 8))
 
-        # path_var holds the actual full path used internally by the pipeline
-        self.path_var = tk.StringVar()
+        # selected_files holds the full paths used internally by the batch pipeline.
+        self.selected_files = []
 
         # ── Output folder preview ─────────────────────────────────────
         self.output_preview_label = tk.Label(
@@ -671,15 +1103,58 @@ class MainScreen(tk.Frame):
 
     # ── Selected invoice display ──────────────────────────────────────
 
-    def _update_selected_display(self, path: str):
-        self.path_var.set(path)
+    def _update_selected_display(self, paths):
+        """Store and display one or more selected invoice PDFs."""
 
-        if path:
-            self.filename_label.configure(text=os.path.basename(path), fg=TEXT)
-            self.path_label.configure(text=path, fg=TEXT_MUTED)
-        else:
-            self.filename_label.configure(text="No file selected yet", fg=TEXT)
+        if isinstance(paths, str):
+            paths = [paths]
+
+        self.selected_files = list(paths)
+
+        self.process_btn.configure(
+            text="Process Invoice"
+            if len(self.selected_files) == 1
+            else "Process Invoices"
+        )
+
+        if not self.selected_files:
+            self.filename_label.configure(
+                text="No invoices selected yet",
+                fg=TEXT,
+            )
             self.path_label.configure(text="", fg=TEXT_MUTED)
+            return
+
+        if len(self.selected_files) == 1:
+            path = self.selected_files[0]
+            self.filename_label.configure(
+                text=os.path.basename(path),
+                fg=TEXT,
+            )
+            self.path_label.configure(
+                text=path,
+                fg=TEXT_MUTED,
+            )
+            return
+
+        names = [
+            os.path.basename(path)
+            for path in self.selected_files[:6]
+        ]
+
+        display = "\n".join(names)
+
+        if len(self.selected_files) > 6:
+            display += f"\n…and {len(self.selected_files) - 6} more"
+
+        self.filename_label.configure(
+            text=f"{len(self.selected_files)} invoices selected",
+            fg=TEXT,
+        )
+        self.path_label.configure(
+            text=display,
+            fg=TEXT_MUTED,
+        )
 
     def _mark_invalid_selection(self, reason: str):
         """Flag the currently selected file as invalid, in place, with a reason."""
@@ -699,20 +1174,21 @@ class MainScreen(tk.Frame):
     def _on_drop(self, event):
         self.drop_zone.configure(bg=PANEL, highlightbackground=BORDER)
         self.drop_label.configure(bg=PANEL, text="Drag & drop your invoice PDF here")
-        dropped_path = event.data.strip().strip("{}")
-        self._update_selected_display(dropped_path)
+        dropped_paths = self.parent.tk.splitlist(event.data)
+        cleaned_paths = [path.strip("{}") for path in dropped_paths]
+        self._update_selected_display(cleaned_paths)
 
     # ── File browser ───────────────────────────────────────────────────
 
     def _browse(self):
         initial = self.config.get("input_folder") or "/"
-        path = filedialog.askopenfilename(
-            title="Select an invoice PDF",
+        paths = filedialog.askopenfilenames(
+            title="Select invoice PDFs",
             initialdir=initial,
             filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
         )
-        if path:
-            self._update_selected_display(path)
+        if paths:
+            self._update_selected_display(paths)
 
     # ── Config ────────────────────────────────────────────────────────
 
@@ -727,45 +1203,62 @@ class MainScreen(tk.Frame):
     # ── Processing ────────────────────────────────────────────────────
 
     def _start_processing(self):
-        pdf_path = self.path_var.get().strip()
-
-        if not pdf_path:
+        if not self.selected_files:
             messagebox.showwarning(
-                "No invoice selected",
-                "Please drag in or browse for an invoice before processing.",
+                "No invoices selected",
+                "Please select one or more invoice PDFs before processing.",
                 parent=self.parent,
             )
             return
 
-        if not os.path.isfile(pdf_path):
-            messagebox.showwarning(
-                "File not found",
-                "We couldn't find that file. Please select it again using the "
-                "Browse button or drag it in.",
-                parent=self.parent,
-            )
-            self._mark_invalid_selection("This file couldn't be found. Please choose it again.")
-            return
+        invalid_files = [
+            path
+            for path in self.selected_files
+            if not os.path.isfile(path)
+            or not path.lower().endswith(".pdf")
+        ]
 
-        if not pdf_path.lower().endswith(".pdf"):
+        if invalid_files:
             messagebox.showwarning(
-                "Wrong file type",
-                "Please choose a PDF file — this looks like a different file type.",
+                "Invalid invoice selection",
+                "One or more selected files are missing or are not PDF files. "
+                "Please correct the selection and try again.",
                 parent=self.parent,
             )
-            self._mark_invalid_selection("This file type isn't supported — please choose a PDF.")
             return
 
         output_folder = self.config.get("output_folder", "pdf_output")
 
-        self.process_btn.configure(state="disabled", text="Processing…", bg="#93C5FD")
+        # Scan the entire batch before any invoice is processed.
+        validation_dialog = ValidationDialog(
+            self.parent,
+            self.selected_files,
+        )
+        self.parent.wait_window(validation_dialog)
+
+        if not validation_dialog.validation_passed:
+            return
+
+        self.process_btn.configure(
+            state="disabled",
+            text="Processing…",
+            bg="#93C5FD",
+        )
+
         dialog = ProcessingDialog(
             self.parent,
-            pdf_path,
+            self.selected_files,
             output_folder,
+            po_exceptions=validation_dialog.approved_exceptions,
         )
+
         self.parent.wait_window(dialog)
-        self.process_btn.configure(state="normal", text="Process Invoice", bg=ACCENT)
+
+        self.process_btn.configure(
+            state="normal",
+            text="Process Invoice" if len(self.selected_files) == 1 else "Process Invoices",
+            bg=ACCENT,
+        )
 
 
 # ---------------------------------------------------------------------------

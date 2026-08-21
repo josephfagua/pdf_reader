@@ -1,84 +1,93 @@
 """
-explorer_manager.py
+explorer_manager.py — Windows Explorer integration for MDIP.
 
-Centralized Windows Explorer integration.
-
-Responsibilities
-----------------
-• Reveal newly created files.
-• Reuse an existing Explorer window for the output folder whenever possible.
-• Open a new Explorer window only when necessary.
-
-No other module should call explorer.exe directly.
+The rest of the application should call only ExplorerManager.reveal().
 """
 
 from __future__ import annotations
+
 import os
+import time
+
 import pythoncom
 import win32com.client
-import win32gui
 import win32con
+import win32gui
 
 
 class ExplorerManager:
-    """Handles all interactions with Windows Explorer."""
+    """Reveal a processed file using the Windows Shell."""
 
-    def reveal(self, file_path: str) -> None:
-        """
-        Reveal a file inside Windows Explorer.
+    def reveal(self, file_path: str) -> bool:
+        """Reuse an Explorer window for the folder or open one if needed."""
 
-        If an Explorer window is already displaying the parent folder,
-        it is reused and brought to the foreground.
-
-        Otherwise a new Explorer window is opened.
-        """
+        file_path = os.path.abspath(file_path)
+        folder = os.path.dirname(file_path)
+        filename = os.path.basename(file_path)
 
         pythoncom.CoInitialize()
 
-        folder = os.path.dirname(os.path.abspath(file_path))
-        filename = os.path.basename(file_path)
-
-        shell = win32com.client.Dispatch("Shell.Application")
-
-        explorer = self._find_existing_window(shell, folder)
-
-        if explorer is None:
-            explorer = shell.Open(folder)
-
-            # Refresh the collection
+        try:
             shell = win32com.client.Dispatch("Shell.Application")
-            explorer = self._find_existing_window(shell, folder)
+            explorer = self._find_window(shell, folder)
 
-        if explorer is None:
-            return
+            if explorer is None:
+                shell.Open(folder)
+                explorer = self._wait_for_window(shell, folder)
 
-        hwnd = explorer.HWND
+            if explorer is None:
+                return False
 
-        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-        win32gui.SetForegroundWindow(hwnd)
-
-        item = explorer.Document.Folder.ParseName(filename)
-
-        if item:
-            explorer.Document.SelectItem(item, 17)
-
-    def _find_existing_window(self, shell, folder):
-
-        folder = os.path.normcase(os.path.abspath(folder))
-
-        for window in shell.Windows():
+            hwnd = int(explorer.HWND)
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
 
             try:
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
 
+            item = explorer.Document.Folder.ParseName(filename)
+
+            if item is None:
+                return False
+
+            explorer.Document.SelectItem(item, 17)
+            return True
+
+        except Exception:
+            return False
+
+        finally:
+            pythoncom.CoUninitialize()
+
+    @staticmethod
+    def _find_window(shell, folder):
+        target = os.path.normcase(
+            os.path.normpath(os.path.abspath(folder))
+        )
+
+        for window in shell.Windows():
+            try:
                 current = os.path.normcase(
-                    os.path.abspath(window.Document.Folder.Self.Path)
+                    os.path.normpath(
+                        os.path.abspath(window.Document.Folder.Self.Path)
+                    )
                 )
-
-                if current == folder:
+                if current == target:
                     return window
-
             except Exception:
                 continue
+
+        return None
+
+    def _wait_for_window(self, shell, folder, timeout=2.0):
+        deadline = time.monotonic() + timeout
+
+        while time.monotonic() < deadline:
+            window = self._find_window(shell, folder)
+            if window is not None:
+                return window
+            time.sleep(0.1)
 
         return None
 
