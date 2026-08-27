@@ -1,7 +1,6 @@
 Welcome to Martins Distribution Invoice Processing Application
 
-This application is intended to be used to extract the information from a pdf file of an invoice into relevant values that can be exported to 
-our clients as csv. 
+This application is intended to be used to extract the information from a pdf file of an invoice into relevant values that can be exported to our clients as csv. 
 
 - The command to turn this project into a single executable file is the following: 
 
