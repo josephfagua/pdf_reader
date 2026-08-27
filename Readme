@@ -5,6 +5,8 @@ our clients as csv.
 
 - The command to turn this project into a single executable file is the following: 
 
+  pip install pyinstaller
+
   pyinstaller ^
       --onefile ^
       --windowed ^
