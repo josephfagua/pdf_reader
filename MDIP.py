@@ -31,6 +31,7 @@ from src.main import extract_text, refine_data, parse_items, extract_order_detai
 from src.validation import validate_invoice
 from src.services.explorer_manager import explorer_manager
 from src.logging_config import setup_logging, get_logger, log_event
+from src.services.history_manager import history_manager
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +103,7 @@ def bring_to_front(window):
 # ---------------------------------------------------------------------------
 
 APP_DIR = Path(os.getenv("LOCALAPPDATA", Path.home())) / "MD Invoice Processor"
+print("APP_DIR exists before mkdir call:", APP_DIR.exists())
 APP_DIR.mkdir(parents=True, exist_ok=True)
 
 CONFIG_FILE = APP_DIR / "config.json"
@@ -123,7 +125,13 @@ def save_config(config: dict) -> None:
 
 
 def is_config_valid(config: dict) -> bool:
-    return bool(config.get("input_folder") and config.get("output_folder"))
+    input_folder = config.get("input_folder", "")
+    output_folder = config.get("output_folder", "")
+    return bool(
+        input_folder and output_folder
+        and os.path.isdir(input_folder)
+        and os.path.isdir(output_folder)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +173,8 @@ _logger = get_logger("mdip")
 
 # Machine name — resolved once, reused in every log entry.
 CURRENT_MACHINE = os.environ.get("COMPUTERNAME", "unknown")
+
+
 
 
 def run_pipeline(
@@ -446,6 +456,7 @@ class ProcessingDialog(tk.Toplevel):
         pdf_paths: list[str],
         output_folder: str,
         po_exceptions: set[str] | None = None,
+        validation_results: list | None = None,
     ):
         super().__init__(parent)
 
@@ -453,6 +464,7 @@ class ProcessingDialog(tk.Toplevel):
         self.pdf_paths = list(pdf_paths)
         self._output_folder = os.path.normpath(output_folder)
         self.po_exceptions = po_exceptions or set()
+        self.validation_results = validation_results or []
 
         self.is_finished = False
         self.success = False
@@ -605,6 +617,26 @@ class ProcessingDialog(tk.Toplevel):
         self.error_message = error_message
 
         if success:
+            # A batch enters history only when every selected invoice completed successfully.
+            try:
+                history_manager.record_batch(
+                    user=CURRENT_USER,
+                    machine=CURRENT_MACHINE,
+                    invoices=self._build_history_invoice_records(),
+                )
+            except Exception as exc:
+                # History must not block a successful batch, but failures must
+                # remain visible for troubleshooting.
+                _logger.error(
+                    "History recording failed: %s",
+                    exc,
+                    extra={
+                        "user": CURRENT_USER,
+                        "invoice_number": "HISTORY",
+                    },
+                    exc_info=True,
+                )
+
             self.header_label.configure(
                 text=f"Batch complete — {len(self.output_paths)} invoice(s)",
                 fg=SUCCESS_FG,
@@ -629,6 +661,29 @@ class ProcessingDialog(tk.Toplevel):
             )
 
         self.close_btn.configure(state="normal", bg=ACCENT)
+
+    def _build_history_invoice_records(self) -> list[dict]:
+        """Build compact invoice records for the local recent-history store."""
+        results_by_path = {
+            os.path.normcase(os.path.abspath(result.invoice_path)): result
+            for result in self.validation_results
+        }
+
+        records = []
+        for pdf_path, output_path in zip(self.pdf_paths, self.output_paths):
+            result = results_by_path.get(
+                os.path.normcase(os.path.abspath(pdf_path))
+            )
+
+            records.append({
+                "invoice_number": result.invoice_number if result else None,
+                "client": result.client if result else None,
+                "source_file": os.path.basename(pdf_path),
+                "output_file": os.path.basename(output_path),
+                "exception_approved": pdf_path in self.po_exceptions,
+            })
+
+        return records
 
     def _thread_safe_status(
         self,
@@ -703,15 +758,12 @@ class ValidationDialog(tk.Toplevel):
     """
     Scan all selected invoices before processing.
 
-    Client-specific Customer PO rules are enforced by validation.py.
-    Explicit second-delivery/system-created exceptions may be approved
-    where validation.py marks them as eligible.
-
-    Blocking validation errors always take priority over exception review.
+    Blank Customer PO values may be explicitly approved as office-created
+    second-delivery exceptions. Non-blank invalid values cannot be bypassed.
     """
 
     WIDTH = 620
-    HEIGHT = 520
+    HEIGHT = 430
 
     def __init__(self, parent, pdf_paths: list[str]):
         super().__init__(parent)
@@ -757,19 +809,9 @@ class ValidationDialog(tk.Toplevel):
         )
         self.progress_label.pack(fill="x", padx=24, pady=(0, 10))
 
-        # Fixed validation-results region. Long batches scroll inside the
-        # region instead of pushing the action buttons outside the window.
-        results_frame = tk.Frame(self, bg=BG)
-        results_frame.pack(
-            fill="both",
-            expand=True,
-            padx=24,
-            pady=(0, 12),
-        )
-
         self.results_text = tk.Text(
-            results_frame,
-            height=12,
+            self,
+            height=15,
             width=72,
             bg=PANEL,
             fg=TEXT,
@@ -779,29 +821,8 @@ class ValidationDialog(tk.Toplevel):
             state="disabled",
             wrap="word",
         )
+        self.results_text.pack(fill="both", expand=True, padx=24, pady=(0, 16))
 
-        results_scrollbar = tk.Scrollbar(
-            results_frame,
-            orient="vertical",
-            command=self.results_text.yview,
-        )
-
-        self.results_text.configure(
-            yscrollcommand=results_scrollbar.set,
-        )
-
-        self.results_text.pack(
-            side="left",
-            fill="both",
-            expand=True,
-        )
-
-        results_scrollbar.pack(
-            side="right",
-            fill="y",
-        )
-
-        # Primary validation action.
         self.action_btn = tk.Button(
             self,
             text="Checking…",
@@ -815,16 +836,11 @@ class ValidationDialog(tk.Toplevel):
             cursor="hand2",
             pady=8,
         )
-        self.action_btn.pack(
-            fill="x",
-            padx=24,
-            pady=(0, 10),
-        )
+        self.action_btn.pack(fill="x", padx=24, pady=(0, 10))
 
-        # Explicit user-facing way to leave validation without processing.
         self.close_review_btn = tk.Button(
             self,
-            text="Cancel Processing",
+            text="Close Review",
             command=self._cancel,
             font=("Segoe UI", 9),
             bg=PANEL,
@@ -833,13 +849,8 @@ class ValidationDialog(tk.Toplevel):
             activeforeground=TEXT,
             relief="flat",
             cursor="hand2",
-            pady=8,
         )
-        self.close_review_btn.pack(
-            fill="x",
-            padx=24,
-            pady=(0, 20),
-        )
+        self.close_review_btn.pack(fill="x", padx=24, pady=(0, 20))
 
     def _scan_invoices(self):
         for index, pdf_path in enumerate(self.pdf_paths, start=1):
@@ -880,18 +891,6 @@ class ValidationDialog(tk.Toplevel):
     def _display_results(self):
         invalid = [result for result in self.results if not result.valid]
 
-        blocking_results = [
-            result
-            for result in invalid
-            if not result.can_approve_exception
-        ]
-
-        exception_results = [
-            result
-            for result in invalid
-            if result.can_approve_exception
-        ]
-
         self.results_text.configure(state="normal")
         self.results_text.delete("1.0", "end")
 
@@ -901,17 +900,10 @@ class ValidationDialog(tk.Toplevel):
                 "✓ All selected invoices passed the required client validation.\n\n"
                 "The batch is ready to be processed.",
             )
-
             self.action_btn.configure(
                 text="Continue to Processing",
-                command=self._review_results,
                 state="normal",
-                bg=ACCENT,
-                fg="white",
-                activebackground=ACCENT_DARK,
-                cursor="hand2",
             )
-
         else:
             self.results_text.insert(
                 "end",
@@ -919,11 +911,10 @@ class ValidationDialog(tk.Toplevel):
             )
 
             for result in invalid:
-                status_text = (
-                    "BLOCKING ERROR — correction required"
-                    if not result.can_approve_exception
-                    else "EXCEPTION AVAILABLE"
-                )
+                if result.can_approve_exception:
+                    status_text = "Exception available"
+                else:
+                    status_text = "BLOCKING ERROR — correction required"
 
                 self.results_text.insert(
                     "end",
@@ -934,7 +925,22 @@ class ValidationDialog(tk.Toplevel):
                     f"Problem: {result.message}\n\n",
                 )
 
-            # A blocking invoice always takes priority over exception review.
+            # A batch is blocked whenever at least one invoice has a
+            # validation error that cannot be resolved through the approved
+            # exception workflow. That blocking condition takes precedence
+            # over invoices that do have exceptions available.
+            blocking_results = [
+                result
+                for result in invalid
+                if not result.can_approve_exception
+            ]
+
+            exception_results = [
+                result
+                for result in invalid
+                if result.can_approve_exception
+            ]
+
             if blocking_results:
                 self.action_btn.configure(
                     text="Return to Invoice Selection",
@@ -943,7 +949,6 @@ class ValidationDialog(tk.Toplevel):
                     bg=ERROR_FG,
                     fg="white",
                     activebackground="#7F1D1D",
-                    cursor="hand2",
                 )
 
             elif exception_results:
@@ -954,7 +959,6 @@ class ValidationDialog(tk.Toplevel):
                     bg=ACCENT,
                     fg="white",
                     activebackground=ACCENT_DARK,
-                    cursor="hand2",
                 )
 
         self.results_text.configure(state="disabled")
@@ -962,14 +966,14 @@ class ValidationDialog(tk.Toplevel):
     def _review_results(self):
         invalid = [result for result in self.results if not result.valid]
 
-        # Defense in depth: an invoice that cannot be resolved through the
-        # approved exception workflow always blocks the entire batch.
         blocking_results = [
             result
             for result in invalid
             if not result.can_approve_exception
         ]
 
+        # Never allow exception review to become a way around a blocking
+        # validation error in the same batch.
         if blocking_results:
             self.action_btn.configure(
                 text="Return to Invoice Selection",
@@ -978,7 +982,6 @@ class ValidationDialog(tk.Toplevel):
                 bg=ERROR_FG,
                 fg="white",
                 activebackground="#7F1D1D",
-                cursor="hand2",
             )
             return
 
@@ -986,27 +989,17 @@ class ValidationDialog(tk.Toplevel):
             if not result.can_approve_exception:
                 continue
 
-            if result.customer_po:
-                po_description = (
-                    f"The Customer PO field contains "
-                    f"'{result.customer_po}'."
-                )
-            else:
-                po_description = "The Customer PO field is blank."
-
-            exception_message = (
-                f"Invoice: {result.invoice_number or 'UNKNOWN'}\n"
-                f"Client: {result.client}\n\n"
-                f"{po_description}\n\n"
-                "Approve this invoice as an office-created or "
-                "system-created second-delivery exception?\n\n"
-                "If approved, the outbound CSV Customer PO will be "
-                "set to 'Verbal'."
-            )
-
             approved = messagebox.askyesno(
                 "Approve Customer PO Exception",
-                exception_message,
+                (
+                    f"Invoice: {result.invoice_number or 'UNKNOWN'}\n"
+                    f"Client: {result.client}\n\n"
+                    "The Customer PO field is blank.\n\n"
+                    "Approve this invoice as an office-created "
+                    "second-delivery or system created invoice exception?\n\n"
+                    "If approved, the outbound CSV Customer PO will be "
+                    "set to 'Verbal'."
+                ),
                 parent=self,
             )
 
@@ -1018,6 +1011,16 @@ class ValidationDialog(tk.Toplevel):
             for result in invalid
             if result.invoice_path not in self.approved_exceptions
         ]
+
+        # A non-blank invalid PO can never be bypassed.
+        if any(not result.can_approve_exception for result in remaining):
+            messagebox.showerror(
+                "Invoices Require Correction",
+                "One or more invoices still contain validation errors. "
+                "Correct those invoices and scan the batch again.",
+                parent=self,
+            )
+            return
 
         if remaining:
             messagebox.showerror(
@@ -1032,9 +1035,127 @@ class ValidationDialog(tk.Toplevel):
         self.destroy()
 
     def _cancel(self):
-        """Cancel the current batch and return to the main invoice screen."""
         self.validation_passed = False
         self.destroy()
+
+
+class HistoryDialog(tk.Toplevel):
+    """Display the two most recent successfully completed processing batches."""
+
+    WIDTH = 700
+    HEIGHT = 520
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self.title("Processing History")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        center_over(self, parent, self.WIDTH, self.HEIGHT)
+        bring_to_front(self)
+        self.iconbitmap(resource_path("Martins-Distribution_RGB.ico"))
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        self._build_ui()
+        self._load_history()
+
+    def _build_ui(self):
+        tk.Label(
+            self,
+            text="Recent Processing History",
+            bg=BG,
+            fg=TEXT,
+            font=("Segoe UI", 14, "bold"),
+            anchor="w",
+        ).pack(fill="x", padx=24, pady=(24, 6))
+
+        tk.Label(
+            self,
+            text="The two most recent successfully completed batches are shown below.",
+            bg=BG,
+            fg=TEXT_MUTED,
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).pack(fill="x", padx=24, pady=(0, 12))
+
+        frame = tk.Frame(self, bg=BG)
+        frame.pack(fill="both", expand=True, padx=24, pady=(0, 12))
+
+        self.history_text = tk.Text(
+            frame,
+            bg=PANEL,
+            fg=TEXT,
+            relief="flat",
+            highlightbackground=BORDER,
+            highlightthickness=1,
+            wrap="word",
+            state="disabled",
+            font=("Segoe UI", 9),
+        )
+        scrollbar = tk.Scrollbar(frame, orient="vertical", command=self.history_text.yview)
+        self.history_text.configure(yscrollcommand=scrollbar.set)
+        self.history_text.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        tk.Button(
+            self,
+            text="Close",
+            command=self.destroy,
+            font=("Segoe UI", 10, "bold"),
+            bg=ACCENT,
+            fg="white",
+            activebackground=ACCENT_DARK,
+            relief="flat",
+            cursor="hand2",
+            pady=8,
+        ).pack(fill="x", padx=24, pady=(0, 20))
+
+    @staticmethod
+    def _format_timestamp(value: str | None) -> str:
+        if not value:
+            return "Unknown time"
+        try:
+            return datetime.datetime.fromisoformat(value).strftime("%b %d, %Y at %I:%M %p")
+        except ValueError:
+            return value
+
+    def _load_history(self):
+        batches = history_manager.get_recent_batches()
+        self.history_text.configure(state="normal")
+        self.history_text.delete("1.0", "end")
+
+        if not batches:
+            self.history_text.insert(
+                "end",
+                "No successfully completed processing batches have been recorded yet.",
+            )
+            self.history_text.configure(state="disabled")
+            return
+
+        for index, batch in enumerate(batches, start=1):
+            clients = ", ".join(batch.get("clients", [])) or "UNKNOWN"
+            self.history_text.insert(
+                "end",
+                f"Batch {index}\n"
+                f"ID: {batch.get('batch_id', 'UNKNOWN')}\n"
+                f"Processed: {self._format_timestamp(batch.get('timestamp'))}\n"
+                f"User: {batch.get('user', 'UNKNOWN')}\n"
+                f"Machine: {batch.get('machine', 'UNKNOWN')}\n"
+                f"Invoices: {batch.get('invoice_count', 0)}\n"
+                f"Clients: {clients}\n\n",
+            )
+
+            for invoice in batch.get("invoices", []):
+                exception = " — PO exception approved" if invoice.get("exception_approved") else ""
+                self.history_text.insert(
+                    "end",
+                    f"  • {invoice.get('invoice_number') or 'UNKNOWN'}"
+                    f" — {invoice.get('client') or 'UNKNOWN'}{exception}\n",
+                )
+
+            self.history_text.insert("end", "\n" + ("─" * 52) + "\n\n")
+
+        self.history_text.configure(state="disabled")
 
 
 # ---------------------------------------------------------------------------
@@ -1086,6 +1207,14 @@ class MainScreen(tk.Frame):
                   activebackground=DROP_HOVER, activeforeground=ACCENT,
                   relief="flat", cursor="hand2").pack(side="right", pady=(6, 0))
 
+
+        tk.Button(header, text="History", command=self._open_history,
+                  font=("Segoe UI", 9), bg=BG, fg=TEXT_MUTED,
+                  activebackground=DROP_HOVER, activeforeground=ACCENT,
+                  relief="flat", cursor="hand2").pack(
+                      side="right", pady=(6, 0), padx=(0, 10)
+                  )
+
         tk.Label(header, text="PDF → CSV", bg=BG, fg=TEXT_MUTED,
                  font=("Segoe UI", 11)).pack(side="right", pady=(6, 0), padx=(0, 12))
 
@@ -1120,84 +1249,31 @@ class MainScreen(tk.Frame):
         for child in inner.winfo_children():
             child.bind("<Button-1>", lambda e: self._browse())
 
-        # ── Selected invoices ─────────────────────────────────────────
+        # ── Selected invoice ──────────────────────────────────────────
         section_label(self, "Selected invoices:")
 
         selected_row = tk.Frame(self, bg=BG)
         selected_row.pack(fill="x", padx=24, pady=(2, 0))
 
-        selected_box = tk.Frame(
-            selected_row,
-            bg=PANEL,
-            relief="flat",
-            highlightbackground=BORDER,
-            highlightthickness=1,
-            height=100,
-        )
+        selected_box = tk.Frame(selected_row, bg=PANEL, relief="flat",
+                                highlightbackground=BORDER, highlightthickness=1)
         selected_box.pack(fill="x", expand=True)
-        selected_box.pack_propagate(False)
 
         self.filename_label = tk.Label(
-            selected_box,
-            text="No invoices selected yet",
-            bg=PANEL,
-            fg=TEXT,
-            font=("Segoe UI", 10, "bold"),
-            anchor="w",
-            justify="left",
+            selected_box, text="No invoices selected yet",
+            bg=PANEL, fg=TEXT, font=("Segoe UI", 10, "bold"),
+            anchor="w", justify="left",
         )
-        self.filename_label.pack(
-            fill="x",
-            padx=10,
-            pady=(8, 4),
-        )
+        self.filename_label.pack(fill="x", padx=10, pady=(8, 0))
 
-        list_frame = tk.Frame(
-            selected_box,
-            bg=PANEL,
+        self.path_label = tk.Label(
+            selected_box, text="",
+            bg=PANEL, fg=TEXT_MUTED, font=("Segoe UI", 8),
+            anchor="w", justify="left", wraplength=380,
         )
-        list_frame.pack(
-            fill="both",
-            expand=True,
-            padx=10,
-            pady=(0, 8),
-        )
+        self.path_label.pack(fill="x", padx=10, pady=(0, 8))
 
-        self.path_listbox = tk.Listbox(
-            list_frame,
-            bg=PANEL,
-            fg=TEXT_MUTED,
-            selectbackground=DROP_HOVER,
-            selectforeground=TEXT,
-            activestyle="none",
-            relief="flat",
-            borderwidth=0,
-            highlightthickness=0,
-            font=("Segoe UI", 8),
-            height=5,
-        )
-
-        selection_scrollbar = tk.Scrollbar(
-            list_frame,
-            orient="vertical",
-            command=self.path_listbox.yview,
-        )
-
-        self.path_listbox.configure(
-            yscrollcommand=selection_scrollbar.set,
-        )
-
-        self.path_listbox.pack(
-            side="left",
-            fill="both",
-            expand=True,
-        )
-        selection_scrollbar.pack(
-            side="right",
-            fill="y",
-        )
-
-        # selected_files holds full paths used by the batch pipeline.
+        # selected_files holds the full paths used internally by the batch pipeline.
         self.selected_files = []
 
         # ── Output folder preview ─────────────────────────────────────
@@ -1209,7 +1285,7 @@ class MainScreen(tk.Frame):
         self._refresh_output_preview()
 
         # ── Process button ────────────────────────────────────────────
-        self.process_btn = tk.Button(self, text="Process Invoices",
+        self.process_btn = tk.Button(self, text="Process Invoice",
                                      command=self._start_processing,
                                      font=("Segoe UI", 11, "bold"),
                                      bg=ACCENT, fg="white",
@@ -1252,28 +1328,49 @@ class MainScreen(tk.Frame):
             else "Process Invoices"
         )
 
+        if not self.selected_files:
+            self.filename_label.configure(
+                text="No invoices selected yet",
+                fg=TEXT,
+            )
+            self.path_label.configure(text="", fg=TEXT_MUTED)
+            return
+
+        if len(self.selected_files) == 1:
+            path = self.selected_files[0]
+            self.filename_label.configure(
+                text=os.path.basename(path),
+                fg=TEXT,
+            )
+            self.path_label.configure(
+                text=path,
+                fg=TEXT_MUTED,
+            )
+            return
+
+        names = [
+            os.path.basename(path)
+            for path in self.selected_files[:6]
+        ]
+
+        display = "\n".join(names)
+
+        if len(self.selected_files) > 6:
+            display += f"\n…and {len(self.selected_files) - 6} more"
+
         self.filename_label.configure(
-            text=(
-                "No invoices selected yet"
-                if not self.selected_files
-                else f"{len(self.selected_files)} invoice(s) selected"
-            ),
+            text=f"{len(self.selected_files)} invoices selected",
             fg=TEXT,
         )
-
-        self.path_listbox.delete(0, tk.END)
-
-        for path in self.selected_files:
-            self.path_listbox.insert(
-                tk.END,
-                os.path.basename(path),
-            )
+        self.path_label.configure(
+            text=display,
+            fg=TEXT_MUTED,
+        )
 
     def _mark_invalid_selection(self, reason: str):
-        """Flag the current selection as invalid and show the reason."""
+        """Flag the currently selected file as invalid, in place, with a reason."""
         self.filename_label.configure(fg=ERROR_FG)
-        self.path_listbox.delete(0, tk.END)
-        self.path_listbox.insert(tk.END, reason)
+        self.path_label.configure(text=reason, fg=ERROR_FG)
 
     # ── Drag-and-drop ──────────────────────────────────────────────────
 
@@ -1313,6 +1410,9 @@ class MainScreen(tk.Frame):
             on_save=self.update_config,
             is_first_launch=False,
         )
+    def _open_history(self):
+        HistoryDialog(self.parent)
+
 
     # ── Processing ────────────────────────────────────────────────────
 
@@ -1353,6 +1453,36 @@ class MainScreen(tk.Frame):
         if not validation_dialog.validation_passed:
             return
 
+        # Check the selected invoice numbers against the two most recent
+        # successful batches before processing a new batch.
+        duplicates = history_manager.find_duplicate_invoices(
+            [result.invoice_number for result in validation_dialog.results]
+        )
+
+        if duplicates:
+            duplicate_lines = [
+                f"Invoice {duplicate['invoice_number']} — "
+                f"previously processed in {duplicate['batch_id']} "
+                f"by {duplicate['user']}"
+                for duplicate in duplicates
+            ]
+
+            duplicate_message = (
+                "The following invoice(s) were processed in one of the "
+                "last two successful batches:\n\n"
+                + "\n".join(duplicate_lines)
+                + "\n\nDo you want to process them again?"
+            )
+
+            should_continue = messagebox.askyesno(
+                "Recently Processed Invoices",
+                duplicate_message,
+                parent=self.parent,
+            )
+
+            if not should_continue:
+                return
+
         self.process_btn.configure(
             state="disabled",
             text="Processing…",
@@ -1364,6 +1494,7 @@ class MainScreen(tk.Frame):
             self.selected_files,
             output_folder,
             po_exceptions=validation_dialog.approved_exceptions,
+            validation_results=validation_dialog.results,
         )
 
         self.parent.wait_window(dialog)
@@ -1446,4 +1577,6 @@ class App:
 
 
 if __name__ == "__main__":
+    
     App()
+    
