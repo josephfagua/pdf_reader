@@ -103,7 +103,6 @@ def bring_to_front(window):
 # ---------------------------------------------------------------------------
 
 APP_DIR = Path(os.getenv("LOCALAPPDATA", Path.home())) / "MD Invoice Processor"
-print("APP_DIR exists before mkdir call:", APP_DIR.exists())
 APP_DIR.mkdir(parents=True, exist_ok=True)
 
 CONFIG_FILE = APP_DIR / "config.json"
@@ -125,13 +124,7 @@ def save_config(config: dict) -> None:
 
 
 def is_config_valid(config: dict) -> bool:
-    input_folder = config.get("input_folder", "")
-    output_folder = config.get("output_folder", "")
-    return bool(
-        input_folder and output_folder
-        and os.path.isdir(input_folder)
-        and os.path.isdir(output_folder)
-    )
+    return bool(config.get("input_folder") and config.get("output_folder"))
 
 
 # ---------------------------------------------------------------------------
@@ -678,6 +671,7 @@ class ProcessingDialog(tk.Toplevel):
             records.append({
                 "invoice_number": result.invoice_number if result else None,
                 "client": result.client if result else None,
+                "delivery_date": result.delivery_date if result else None,
                 "source_file": os.path.basename(pdf_path),
                 "output_file": os.path.basename(output_path),
                 "exception_approved": pdf_path in self.po_exceptions,
@@ -763,7 +757,7 @@ class ValidationDialog(tk.Toplevel):
     """
 
     WIDTH = 620
-    HEIGHT = 430
+    HEIGHT = 455
 
     def __init__(self, parent, pdf_paths: list[str]):
         super().__init__(parent)
@@ -880,6 +874,7 @@ class ValidationDialog(tk.Toplevel):
                         customer_name=None,
                         client=None,
                         customer_po=None,
+                        delivery_date=None,
                         valid=False,
                         can_approve_exception=False,
                         message=f"Could not scan invoice: {exc}",
@@ -920,6 +915,7 @@ class ValidationDialog(tk.Toplevel):
                     "end",
                     f"Invoice: {result.invoice_number or 'UNKNOWN'}\n"
                     f"Client: {result.client or 'UNKNOWN'}\n"
+                    f"Delivery Date: {result.delivery_date or 'UNKNOWN'}\n"
                     f"File: {os.path.basename(result.invoice_path)}\n"
                     f"Status: {status_text}\n"
                     f"Problem: {result.message}\n\n",
@@ -993,7 +989,8 @@ class ValidationDialog(tk.Toplevel):
                 "Approve Customer PO Exception",
                 (
                     f"Invoice: {result.invoice_number or 'UNKNOWN'}\n"
-                    f"Client: {result.client}\n\n"
+                    f"Client: {result.client}\n"
+                    f"Delivery Date: {result.delivery_date or 'UNKNOWN'}\n\n"
                     "The Customer PO field is blank.\n\n"
                     "Approve this invoice as an office-created "
                     "second-delivery or system created invoice exception?\n\n"
@@ -1150,7 +1147,8 @@ class HistoryDialog(tk.Toplevel):
                 self.history_text.insert(
                     "end",
                     f"  • {invoice.get('invoice_number') or 'UNKNOWN'}"
-                    f" — {invoice.get('client') or 'UNKNOWN'}{exception}\n",
+                    f" — {invoice.get('client') or 'UNKNOWN'}{exception}\n"
+                    f"    Delivery Date: {invoice.get('delivery_date') or 'UNKNOWN'}\n",
                 )
 
             self.history_text.insert("end", "\n" + ("─" * 52) + "\n\n")
@@ -1208,7 +1206,7 @@ class MainScreen(tk.Frame):
                   relief="flat", cursor="hand2").pack(side="right", pady=(6, 0))
 
 
-        tk.Button(header, text="History", command=self._open_history,
+        tk.Button(header, text="▤ History", command=self._open_history,
                   font=("Segoe UI", 9), bg=BG, fg=TEXT_MUTED,
                   activebackground=DROP_HOVER, activeforeground=ACCENT,
                   relief="flat", cursor="hand2").pack(
@@ -1577,6 +1575,4 @@ class App:
 
 
 if __name__ == "__main__":
-    
     App()
-    
