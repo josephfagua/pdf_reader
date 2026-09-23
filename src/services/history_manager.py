@@ -20,7 +20,7 @@ from typing import Any
 
 APP_DIR = Path(os.getenv("LOCALAPPDATA", Path.home())) / "MD Invoice Processor"
 HISTORY_FILE = APP_DIR / "history.json"
-MAX_BATCHES = 2
+MAX_BATCHES = 10
 
 
 def _now_iso() -> str:

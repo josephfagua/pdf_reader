@@ -1248,32 +1248,87 @@ class MainScreen(tk.Frame):
             child.bind("<Button-1>", lambda e: self._browse())
 
         # ── Selected invoice ──────────────────────────────────────────
+        # ── Selected invoices ──────────────────────────────────────────
         section_label(self, "Selected invoices:")
 
         selected_row = tk.Frame(self, bg=BG)
         selected_row.pack(fill="x", padx=24, pady=(2, 0))
 
-        selected_box = tk.Frame(selected_row, bg=PANEL, relief="flat",
-                                highlightbackground=BORDER, highlightthickness=1)
+        selected_box = tk.Frame(
+            selected_row,
+            bg=PANEL,
+            relief="flat",
+            highlightbackground=BORDER,
+            highlightthickness=1,
+            height=90,
+        )
         selected_box.pack(fill="x", expand=True)
+        selected_box.pack_propagate(False)
 
         self.filename_label = tk.Label(
-            selected_box, text="No invoices selected yet",
-            bg=PANEL, fg=TEXT, font=("Segoe UI", 10, "bold"),
-            anchor="w", justify="left",
+            selected_box,
+            text="No invoices selected yet",
+            bg=PANEL,
+            fg=TEXT,
+            font=("Segoe UI", 10, "bold"),
+            anchor="w",
+            justify="left",
         )
-        self.filename_label.pack(fill="x", padx=10, pady=(8, 0))
+        self.filename_label.pack(
+            fill="x",
+            padx=10,
+            pady=(8, 4),
+        )
 
-        self.path_label = tk.Label(
-            selected_box, text="",
-            bg=PANEL, fg=TEXT_MUTED, font=("Segoe UI", 8),
-            anchor="w", justify="left", wraplength=380,
+        # Scrollable invoice list
+        list_frame = tk.Frame(
+            selected_box,
+            bg=PANEL,
         )
-        self.path_label.pack(fill="x", padx=10, pady=(0, 8))
+        list_frame.pack(
+            fill="both",
+            expand=True,
+            padx=10,
+            pady=(0, 8),
+        )
+
+        self.path_listbox = tk.Listbox(
+            list_frame,
+            bg=PANEL,
+            fg=TEXT_MUTED,
+            selectbackground=DROP_HOVER,
+            selectforeground=TEXT,
+            activestyle="none",
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            font=("Segoe UI", 8),
+            height=5,
+        )
+
+        selection_scrollbar = tk.Scrollbar(
+            list_frame,
+            orient="vertical",
+            command=self.path_listbox.yview,
+        )
+
+        self.path_listbox.configure(
+            yscrollcommand=selection_scrollbar.set,
+        )
+
+        self.path_listbox.pack(
+            side="left",
+            fill="both",
+            expand=True,
+        )
+
+        selection_scrollbar.pack(
+            side="right",
+            fill="y",
+        )
 
         # selected_files holds the full paths used internally by the batch pipeline.
         self.selected_files = []
-
         # ── Output folder preview ─────────────────────────────────────
         self.output_preview_label = tk.Label(
             self, text="", bg=BG, fg=TEXT_MUTED,
@@ -1326,49 +1381,30 @@ class MainScreen(tk.Frame):
             else "Process Invoices"
         )
 
-        if not self.selected_files:
-            self.filename_label.configure(
-                text="No invoices selected yet",
-                fg=TEXT,
-            )
-            self.path_label.configure(text="", fg=TEXT_MUTED)
-            return
-
-        if len(self.selected_files) == 1:
-            path = self.selected_files[0]
-            self.filename_label.configure(
-                text=os.path.basename(path),
-                fg=TEXT,
-            )
-            self.path_label.configure(
-                text=path,
-                fg=TEXT_MUTED,
-            )
-            return
-
-        names = [
-            os.path.basename(path)
-            for path in self.selected_files[:6]
-        ]
-
-        display = "\n".join(names)
-
-        if len(self.selected_files) > 6:
-            display += f"\n…and {len(self.selected_files) - 6} more"
-
         self.filename_label.configure(
-            text=f"{len(self.selected_files)} invoices selected",
+            text=(
+                "No invoices selected yet"
+                if not self.selected_files
+                else f"{len(self.selected_files)} invoice(s) selected"
+            ),
             fg=TEXT,
         )
-        self.path_label.configure(
-            text=display,
-            fg=TEXT_MUTED,
+
+        self.path_listbox.delete(0, tk.END)
+
+        for path in self.selected_files:
+            self.path_listbox.insert(
+            tk.END,
+            os.path.basename(path),
         )
 
     def _mark_invalid_selection(self, reason: str):
-        """Flag the currently selected file as invalid, in place, with a reason."""
+        """Flag the current selection as invalid and show the reason."""
+
         self.filename_label.configure(fg=ERROR_FG)
-        self.path_label.configure(text=reason, fg=ERROR_FG)
+
+        self.path_listbox.delete(0, tk.END)
+        self.path_listbox.insert(tk.END, reason)
 
     # ── Drag-and-drop ──────────────────────────────────────────────────
 
