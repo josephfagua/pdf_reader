@@ -14,7 +14,7 @@ import re
 from src.models import OrderDetails
 
 
-VELVET_LOCATIONS = ("NORTH HILLS", "SOUTHEND", "PARK RD")
+VELVET_LOCATIONS = ("NORTH HILLS", "SOUTHEND", "PARK ROAD")
 VALID_VELVET_PO = re.compile(r"^VO\d{6}$", re.IGNORECASE)
 
 

@@ -1,21 +1,178 @@
-Welcome to Martins Distribution Invoice Processing Application
+# Martins Distribution Invoice Processing Application
 
-This application is intended to be used to extract the information from a pdf file of an invoice into relevant values that can be exported to martins distribution clients as readable csv files for use in client systems. 
+## Overview
 
-- The command to turn this project into a single executable file is the following: 
+The Martins Distribution Invoice Processing Application (MDIP) is a Windows desktop application that extracts information from Martin's Distribution invoice PDF files, validates the invoice information according to client-specific requirements, and exports the resulting invoice data as CSV files for client submission.
 
-  pip install pyinstaller
+The application is designed to reduce manual invoice-entry work, provide validation before processing, and maintain a small local processing history for recently completed batches.
 
-  pyinstaller ^
-      --onefile ^
-      --windowed ^
-      --clean ^
-      --noconfirm ^
-      --icon="Martins-Distribution_RGB.ico" ^
-      --collect-all tkinterdnd2 ^
-      --collect-all pydantic_core ^
-      --collect-all pymupdf ^
-      --add-data "Martins-Distribution_RGB.ico;." ^
-      MDIP.py
+## Features
 
-Once this is run you will have MDIP.exe (Martins Distribution Invoice Processing) executable file ready to be downloaded on any device. 
+- Extracts invoice information and line-item data from Martin's Distribution PDF invoices.
+- Extracts invoice metadata including:
+  - Customer number
+  - Customer name
+  - Customer purchase order
+  - Delivery date
+  - Invoice number
+  - Invoice total
+- Exports processed invoices as client-compatible CSV files.
+- Supports multiple client locations:
+  - Taco Bamba
+  - Velvet Taco North Hills
+  - Velvet Taco Southend
+  - Velvet Taco Park Rd
+- Applies client-specific Customer PO validation rules before processing.
+- Allows approved exceptions for office-created or system-created second-delivery invoices when permitted by the validation rules.
+- Includes invoice delivery dates in validation and processing-history views.
+- Detects invoice numbers that were processed in one of the two most recent successful batches and provides a duplicate-processing warning before processing.
+- Maintains a local history of the two most recent successful processing batches.
+- Records processing information such as user, machine, batch, invoice, client, output file, and approved PO exceptions.
+- Provides a processing progress interface and opens the resulting file in Windows Explorer after successful processing.
+- Supports drag-and-drop invoice selection when `tkinterdnd2` is available.
+- Uses local application data for configuration, history, and logging.
+
+## Project Structure
+
+The project uses `MDIP.py` as the application entry point.
+
+```text
+pdf_reader/
+├── MDIP.py
+├── Martins-Distribution_RGB.ico
+├── Readme
+├── requirements.txt
+└── src/
+    ├── main.py
+    ├── models.py
+    ├── validation.py
+    ├── logging_config.py
+    └── services/
+        └── history_manager.py
+        └── explorer_manager.py
+```
+
+## Configuration
+
+On first launch, the application asks the user to select:
+
+1. The folder containing invoice PDFs.
+2. The folder where processed CSV files should be saved.
+
+The configuration is stored locally in:
+
+```text
+%LOCALAPPDATA%\\MD Invoice Processor\\config.json
+```
+
+## Processing Workflow
+
+The normal processing workflow is:
+
+```text
+Select invoice PDF(s)
+        ↓
+Scan and extract invoice information
+        ↓
+Validate client and Customer PO requirements
+        ↓
+Review exceptions when applicable
+        ↓
+Check recent invoice history for duplicates
+        ↓
+Process invoice(s)
+        ↓
+Export CSV file(s)
+        ↓
+Record successful batch in history
+        ↓
+Reveal the output file in Windows Explorer
+```
+
+A batch is only added to processing history when all selected invoices complete successfully.
+
+## Local Application Data
+
+MDIP stores application data under:
+
+```text
+%LOCALAPPDATA%\\MD Invoice Processor
+```
+
+The directory contains the following:
+
+```text
+config.json
+history.json
+logs\\app.log
+```
+
+`history.json` contains the two most recent successfully completed processing batches.
+
+The local log is intended to provide a fallback record of application activity. A network log location may also be configured.
+
+## Requirements
+
+The application is developed for Windows and uses Python.
+
+Install the project dependencies with:
+
+```cmd
+pip install -r requirements.txt
+```
+
+PyInstaller is required only when creating the standalone executable:
+
+```cmd
+pip install pyinstaller
+```
+
+## Creating the Standalone Executable
+
+Run the following command from the project root directory:
+
+```cmd
+pyinstaller ^
+    --onefile ^
+    --windowed ^
+    --clean ^
+    --noconfirm ^
+    --icon="Martins-Distribution_RGB.ico" ^
+    --collect-all tkinterdnd2 ^
+    --collect-all pydantic_core ^
+    --collect-all pymupdf ^
+    --add-data "Martins-Distribution_RGB.ico;." ^
+    MDIP.py
+```
+
+After the build completes, the standalone executable will be located in:
+
+```text
+dist\\MDIP.exe
+```
+
+`MDIP.exe` packages the Python application and its required Python dependencies into a single Windows executable so the application can be distributed to other Windows devices without requiring the user to manually install the Python project dependencies.
+
+## Development
+
+For normal development, run the application from the project root:
+
+```cmd
+python MDIP.py
+```
+
+The application entry point is:
+
+```text
+MDIP.py
+```
+
+The reusable processing and business logic is contained in the `src` package.
+
+## Notes
+
+- Keep `MDIP.py` in the project root when running the application or building the executable.
+- Keep the Martins Distribution icon file available to PyInstaller during the build.
+- Only successfully completed batches are recorded in processing history.
+- Duplicate invoice detection is intended as a warning and confirmation step rather than a hard block.
+- The application does not modify the source invoice PDF when an exception is approved. The exception affects the value written to the outbound CSV.
