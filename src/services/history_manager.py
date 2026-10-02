@@ -2,7 +2,7 @@
 history_manager.py — Recent successful processing history for MDIP.
 
 Phase 3 foundation:
-- Keeps the two most recent successfully completed batches.
+- Keeps the 10 most recent successfully completed batches.
 - Stores history locally under LOCALAPPDATA MD Invoice Processor.
 - Uses invoice number as the duplicate-detection key.
 - History storage failures never prevent a batch from completing.
@@ -34,7 +34,7 @@ def _create_batch_id() -> str:
 
 
 class HistoryManager:
-    """Manage MDIP's two most recent successful processing batches."""
+    """Manage MDIP's 10 most recent successful processing batches."""
 
     def __init__(self, history_file: Path | None = None, max_batches: int = MAX_BATCHES):
         self.history_file = history_file or HISTORY_FILE
@@ -59,7 +59,7 @@ class HistoryManager:
         machine: str,
         invoices: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        """Record one fully successful batch and retain only the two newest batches."""
+        """Record one fully successful batch and retain only the 10 newest batches."""
         batch = {
             "batch_id": _create_batch_id(),
             "timestamp": _now_iso(),
@@ -76,7 +76,7 @@ class HistoryManager:
         self,
         invoice_numbers: list[str | None],
     ) -> list[dict[str, Any]]:
-        """Find selected invoice numbers in either of the two recent batches."""
+        """Find selected invoice numbers in the 10 most recent batches."""
         numbers = {
             str(number).strip().upper()
             for number in invoice_numbers

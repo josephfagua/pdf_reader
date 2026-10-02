@@ -16,8 +16,8 @@ from pathlib import Path
 import json
 import threading
 import sys
-import pathlib
 import datetime
+import uuid
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 
@@ -30,8 +30,23 @@ except ImportError:
 from src.main import extract_text, refine_data, parse_items, extract_order_details, export_items_csv
 from src.validation import validate_invoice
 from src.services.explorer_manager import explorer_manager
-from src.logging_config import setup_logging, get_logger, log_event
+from src.logging_config import (
+    setup_logging,
+    reconfigure_logging,
+    get_logger,
+    log_batch_event,
+    log_batch_error,
+    log_invoice_error,
+)
 from src.services.history_manager import history_manager
+from src.services.admin_config import (
+    load_admin_config,
+    get_audit_log_path,
+    get_admin_config_path,
+    save_admin_config,
+    DEFAULT_AUDIT_LOG_FILE,
+)
+from src.services.system_audit_manager import get_latest_invoices, update_latest_invoices
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +59,12 @@ except Exception:
     CURRENT_USER = os.environ.get("USERNAME", "unknown")
 
 
+# Temporary administrator gate. This is intentionally simple until a more
+# secure administrator authentication mechanism is selected.
+ADMIN_PASSWORD = "1604"
+AUDIT_LOG_PATH: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Helper functions for tkinter windows
 # ---------------------------------------------------------------------------
@@ -54,8 +75,14 @@ def resource_path(relative_path: str) -> str:
     return str(base_path / relative_path)
 
 
-def center_window(window, width: int, height: int):
-    window.withdraw()  # hide
+def center_window(window, width: int, height: int, reveal: bool = True):
+    """Center a window on the primary screen.
+
+    ``reveal=False`` keeps a newly-created Toplevel hidden while its controls
+    are constructed. The caller can then deiconify it after the window is
+    fully built, preventing a brief blank/partially-rendered window flash.
+    """
+    window.withdraw()
 
     window.update_idletasks()
 
@@ -67,12 +94,23 @@ def center_window(window, width: int, height: int):
 
     window.geometry(f"{width}x{height}+{x}+{y}")
 
-    window.deiconify()  # reveal
+    if reveal:
+        window.deiconify()
 
 
-def center_over(window, parent_window, width: int, height: int):
-    """Center a window over a parent window (rather than the screen)."""
-    window.withdraw()  # hide
+def center_over(
+    window,
+    parent_window,
+    width: int,
+    height: int,
+    reveal: bool = True,
+):
+    """Center a window over a parent window.
+
+    ``reveal=False`` keeps a newly-created Toplevel hidden until its UI is
+    completely constructed.
+    """
+    window.withdraw()
 
     window.update_idletasks()
     parent_window.update_idletasks()
@@ -87,7 +125,8 @@ def center_over(window, parent_window, width: int, height: int):
 
     window.geometry(f"{width}x{height}+{x}+{y}")
 
-    window.deiconify()  # reveal
+    if reveal:
+        window.deiconify()
 
 
 def bring_to_front(window):
@@ -159,6 +198,8 @@ TOTAL_STEPS = 5
 
 _logger = get_logger("mdip")
 
+AUDIT_LOG_PATH: str | None = None
+
 
 # ---------------------------------------------------------------------------
 # Pipeline runner
@@ -175,22 +216,8 @@ def run_pipeline(
     output_folder: str,
     status_callback,
     po_exception_approved: bool = False,
-) -> None:
-    """
-    Runs the full pipeline in a background thread, reporting progress via
-    status_callback(header, detail, step, is_error, success, output_path).
-
-    `header` is a short label meant for the dialog's prominent header text.
-    `detail` is optional longer text shown on a smaller line below — used
-    only for the final success/error states, empty during normal steps.
-
-    `step` is the progress bar value (1-TOTAL_STEPS) to display, or None to
-    leave the bar exactly where it currently is (used on error, so the bar
-    freezes at the point of failure instead of resetting).
-
-    `output_path` is only set on success, so the dialog can offer to reveal
-    the finished file once the user closes it.
-    """
+) -> dict | None:
+    """Process one invoice and return processing metadata on success."""
     pdf_path = pdf_path.strip().strip("{}")
 
     if not os.path.isfile(pdf_path):
@@ -201,7 +228,7 @@ def run_pipeline(
             step=None,
             is_error=True,
         )
-        return
+        return None
 
     if not pdf_path.lower().endswith(".pdf"):
         status_callback(
@@ -210,10 +237,8 @@ def run_pipeline(
             step=None,
             is_error=True,
         )
-        return
+        return None
 
-    # Collect file metadata before processing starts.
-    invoice_filename = os.path.basename(pdf_path)
     invoice_number_for_log = "UNKNOWN"
     try:
         file_size_kb = round(os.path.getsize(pdf_path) / 1024, 1)
@@ -236,11 +261,18 @@ def run_pipeline(
 
         order_data = {
             "order_details": extract_order_details(cleaned_text),
-            "items":         parse_items(cleaned_text),
+            "items": parse_items(cleaned_text),
         }
         item_count = len(order_data["items"])
-        invoice_number_for_log = order_data["order_details"].invoice_number or "UNKNOWN"
-        status_callback("Finding your items and order info…", "", step=4, is_error=False)
+        invoice_number_for_log = (
+            order_data["order_details"].invoice_number or "UNKNOWN"
+        )
+        status_callback(
+            "Finding your items and order info…",
+            "",
+            step=4,
+            is_error=False,
+        )
         time.sleep(STEP_DELAY)
 
         os.makedirs(output_folder, exist_ok=True)
@@ -263,41 +295,43 @@ def run_pipeline(
             output_path=output_path,
         )
 
-        log_event(
-            _logger,
-            user=CURRENT_USER,
-            machine=CURRENT_MACHINE,
-            invoice_number=invoice_number_for_log,
-            file_size_kb=file_size_kb,
-            duration_s=duration_s,
-            item_count=item_count,
-            status="SUCCESS",
-            detail=os.path.basename(output_path),
-        )
+        return {
+            "status": "SUCCESS",
+            "invoice_number": invoice_number_for_log,
+            "file_size_kb": file_size_kb,
+            "duration_s": duration_s,
+            "item_count": item_count,
+            "output_path": output_path,
+            "source_file": os.path.basename(pdf_path),
+        }
 
     except Exception as exc:
         duration_s = round(time.monotonic() - start_time, 1)
-        log_event(
+        log_invoice_error(
             _logger,
             user=CURRENT_USER,
             machine=CURRENT_MACHINE,
             invoice_number=invoice_number_for_log,
-            file_size_kb=file_size_kb,
-            duration_s=duration_s,
-            item_count=0,
-            status="ERROR",
-            detail=str(exc),
+            detail=(
+                f"Failed while processing {os.path.basename(pdf_path)} "
+                f"after {duration_s}s."
+            ),
+            exc=exc,
         )
-        # The real exception is logged above; we show a friendly message to
-        # the user — raw tracebacks are meaningless and alarming to
-        # non-technical staff.
+        exception_detail = f"{type(exc).__name__}: {exc}"
         status_callback(
             "Something went wrong",
-            "Please make sure it's a Martin's Distribution invoice PDF, then "
-            "try again. If this keeps happening, contact support.",
-            step=None,  # freeze the bar at whatever step it last reached
+            f"Exception: {exception_detail}",
+            step=None,
             is_error=True,
         )
+        return {
+            "status": "ERROR",
+            "invoice_number": invoice_number_for_log,
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+            "source_file": os.path.basename(pdf_path),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -343,93 +377,660 @@ def folder_row(parent, label_text, path_var):
 # ---------------------------------------------------------------------------
 
 class ConfigScreen(tk.Toplevel):
-    """
-    Opened on first launch (before main screen) or via the config button.
-    on_save(config) is called when the user saves valid config.
+    """User-facing configuration window.
+
+    Only input/output folders are user-configurable here.  Administrator
+    settings are opened through a separate password-gated window.
+
+    This window intentionally does not use a Tk grab.  A nested modal grab
+    caused Windows to retain input focus after the administrator dialogs were
+    closed, which could make the application appear frozen.
     """
 
     def __init__(self, parent, current_config: dict, on_save, is_first_launch: bool = False):
         super().__init__(parent)
+
         self.title("Configuration")
         self.configure(bg=BG)
         self.resizable(False, False)
-        center_window(self, 500, 360)
-        bring_to_front(self)
-        self.grab_set()
+        center_window(self, 500, 410, reveal=False)
         self.iconbitmap(resource_path("Martins-Distribution_RGB.ico"))
+        self.transient(parent)
+
         self.on_save = on_save
         self.is_first_launch = is_first_launch
-        self._current_config = current_config  # preserved so _save can carry log_path forward
+        self._current_config = current_config
+        self._admin_password_dialog = None
+        self._admin_config_window = None
 
-        # If closed via the X on first launch, quit the whole app
         if is_first_launch:
             self.protocol("WM_DELETE_WINDOW", parent.destroy)
+        else:
+            self.protocol("WM_DELETE_WINDOW", self._close)
 
         self._build_ui(current_config)
 
+        # Do not reveal the window until the complete UI has been built.
+        self.deiconify()
+        bring_to_front(self)
+
     def _build_ui(self, current_config: dict):
-        # Title
         title_frame = tk.Frame(self, bg=BG)
         title_frame.pack(fill="x", padx=24, pady=(28, 4))
 
         heading = "Welcome — let's get set up" if self.is_first_launch else "Configuration"
-        tk.Label(title_frame, text=heading, bg=BG, fg=TEXT,
-                 font=("Segoe UI", 16, "bold"), anchor="w").pack(side="left")
+        tk.Label(
+            title_frame,
+            text=heading,
+            bg=BG,
+            fg=TEXT,
+            font=("Segoe UI", 16, "bold"),
+            anchor="w",
+        ).pack(side="left")
 
         divider(self)
 
-        # Folder fields
-        self.input_var  = tk.StringVar(value=current_config.get("input_folder", ""))
+        self.input_var = tk.StringVar(value=current_config.get("input_folder", ""))
         self.output_var = tk.StringVar(value=current_config.get("output_folder", ""))
 
         folder_row(self, "Where are your invoice PDFs saved?", self.input_var)
         folder_row(self, "Where should we save your finished files?", self.output_var)
 
-        # Validation message
-        self.validation_label = tk.Label(self, text="", bg=BG, fg=ERROR_FG,
-                                         font=("Segoe UI", 9), anchor="w")
+        self.validation_label = tk.Label(
+            self,
+            text="",
+            bg=BG,
+            fg=ERROR_FG,
+            font=("Segoe UI", 9),
+            anchor="w",
+            wraplength=450,
+            justify="left",
+        )
         self.validation_label.pack(fill="x", padx=24, pady=(0, 12))
 
-        # Save button
         btn_text = "Save & Continue" if self.is_first_launch else "Save"
-        tk.Button(self, text=btn_text, command=self._save,
-                  font=("Segoe UI", 11, "bold"),
-                  bg=ACCENT, fg="white",
-                  activebackground=ACCENT_DARK, activeforeground="white",
-                  relief="flat", cursor="hand2", pady=10).pack(fill="x", padx=24)
+        tk.Button(
+            self,
+            text=btn_text,
+            command=self._save,
+            font=("Segoe UI", 11, "bold"),
+            bg=ACCENT,
+            fg="white",
+            activebackground=ACCENT_DARK,
+            activeforeground="white",
+            relief="flat",
+            cursor="hand2",
+            pady=10,
+        ).pack(fill="x", padx=24, pady=(0, 8))
+
+        tk.Button(
+            self,
+            text="Admin Settings…",
+            command=self._open_admin_settings,
+            font=("Segoe UI", 9, "bold"),
+            bg=PANEL,
+            fg=TEXT_MUTED,
+            activebackground=DROP_HOVER,
+            activeforeground=ACCENT,
+            relief="flat",
+            cursor="hand2",
+            highlightbackground=BORDER,
+            highlightthickness=1,
+            pady=7,
+        ).pack(fill="x", padx=24, pady=(0, 20))
+
+    def _close(self):
+        try:
+            if not self.is_first_launch and getattr(self.parent, "main_screen", None) is not None:
+                if getattr(self.parent.main_screen, "_config_window", None) is self:
+                    self.parent.main_screen._config_window = None
+        except (AttributeError, tk.TclError):
+            pass
+        self.destroy()
+
+    def _open_admin_settings(self):
+        # Prevent multiple authentication dialogs from stacking.
+        if self._admin_password_dialog is not None:
+            try:
+                if self._admin_password_dialog.winfo_exists():
+                    self._admin_password_dialog.lift()
+                    self._admin_password_dialog.focus_force()
+                    return
+            except tk.TclError:
+                pass
+
+        self._admin_password_dialog = AdminPasswordDialog(
+            self,
+            self._open_admin_settings_window,
+        )
+
+    def _open_admin_settings_window(self):
+        self._admin_password_dialog = None
+        if getattr(self, "_admin_config_window", None) is not None:
+            try:
+                if self._admin_config_window.winfo_exists():
+                    self._admin_config_window.lift()
+                    self._admin_config_window.focus_force()
+                    return
+            except tk.TclError:
+                pass
+
+        self._admin_config_window = AdminConfigScreen(self)
 
     def _save(self):
-        input_folder  = self.input_var.get().strip()
+        input_folder = self.input_var.get().strip()
         output_folder = self.output_var.get().strip()
 
         if not input_folder or not output_folder:
-            self.validation_label.configure(text="Please choose both an input and output folder.")
+            self.validation_label.configure(
+                text="Please choose both an input and output folder."
+            )
             return
 
         if not os.path.isdir(input_folder):
-            self.validation_label.configure(text="That input folder couldn't be found. Please check the path or use Browse.")
+            self.validation_label.configure(
+                text=(
+                    "That input folder couldn't be found. "
+                    "Please check the path or use Browse."
+                )
+            )
             return
 
         if not os.path.isdir(output_folder):
             try:
                 os.makedirs(output_folder, exist_ok=True)
             except OSError:
-                self.validation_label.configure(text="We couldn't create that output folder. Please choose a different location.")
+                self.validation_label.configure(
+                    text=(
+                        "We couldn't create that output folder. "
+                        "Please choose a different location."
+                    )
+                )
                 return
 
         config = {
-            "input_folder":  input_folder,
+            "input_folder": input_folder,
             "output_folder": output_folder,
-            "log_path":      self._current_config.get("log_path", "\\\\SERVER\\MDIPLogs\\app.log"),
         }
-        save_config(config)
+        try:
+            save_config(config)
+        except Exception as exc:
+            self.validation_label.configure(
+                text=f"Could not save configuration. Exception: {type(exc).__name__}: {exc}"
+            )
+            return
+
         self.on_save(config)
         self.destroy()
 
 
-# ---------------------------------------------------------------------------
-# Processing dialog (modal — shown while an invoice is being processed)
-# ---------------------------------------------------------------------------
+class AdminPasswordDialog(tk.Toplevel):
+    """Temporary password gate for administrator-only settings."""
+
+    WIDTH = 360
+    HEIGHT = 190
+
+    def __init__(self, parent, on_success):
+        super().__init__(parent)
+        self.parent = parent
+        self.on_success = on_success
+
+        self.title("Administrator Authentication")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        center_over(self, parent, self.WIDTH, self.HEIGHT, reveal=False)
+        self.iconbitmap(resource_path("Martins-Distribution_RGB.ico"))
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        tk.Label(
+            self,
+            text="Administrator Settings",
+            bg=BG,
+            fg=TEXT,
+            font=("Segoe UI", 13, "bold"),
+        ).pack(fill="x", padx=24, pady=(22, 6))
+
+        tk.Label(
+            self,
+            text="Enter the administrator password to continue.",
+            bg=BG,
+            fg=TEXT_MUTED,
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).pack(fill="x", padx=24, pady=(0, 10))
+
+        self.password_var = tk.StringVar()
+        self.password_entry = tk.Entry(
+            self,
+            textvariable=self.password_var,
+            show="*",
+            font=("Segoe UI", 11),
+            bg=PANEL,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+            highlightbackground=BORDER,
+            highlightthickness=1,
+        )
+        self.password_entry.pack(fill="x", padx=24, pady=(0, 6), ipady=6)
+        self.password_entry.bind("<Return>", lambda _event: self._submit())
+
+        self.error_label = tk.Label(
+            self,
+            text="",
+            bg=BG,
+            fg=ERROR_FG,
+            font=("Segoe UI", 8),
+            anchor="w",
+        )
+        self.error_label.pack(fill="x", padx=24, pady=(0, 8))
+
+        button_row = tk.Frame(self, bg=BG)
+        button_row.pack(fill="x", padx=24, pady=(0, 16))
+
+        tk.Button(
+            button_row,
+            text="Cancel",
+            command=self._close,
+            font=("Segoe UI", 9),
+            bg=PANEL,
+            fg=TEXT_MUTED,
+            relief="flat",
+            cursor="hand2",
+            padx=12,
+            pady=6,
+        ).pack(side="left")
+
+        tk.Button(
+            button_row,
+            text="Continue",
+            command=self._submit,
+            font=("Segoe UI", 9, "bold"),
+            bg=ACCENT,
+            fg="white",
+            activebackground=ACCENT_DARK,
+            activeforeground="white",
+            relief="flat",
+            cursor="hand2",
+            padx=14,
+            pady=6,
+        ).pack(side="right")
+
+        # Reveal only after every widget has been created.
+        self.deiconify()
+        bring_to_front(self)
+        self.after_idle(self._activate_modal)
+
+    def _activate_modal(self):
+        if not self.winfo_exists():
+            return
+        try:
+            self.grab_set()
+            self.lift()
+            self.focus_force()
+            self.password_entry.focus_force()
+        except tk.TclError:
+            pass
+
+    def _close(self):
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
+        try:
+            if getattr(self.parent, "_admin_password_dialog", None) is self:
+                self.parent._admin_password_dialog = None
+            self.parent.after_idle(self.parent.focus_force)
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _submit(self):
+        if self.password_var.get() != ADMIN_PASSWORD:
+            self.error_label.configure(text="Incorrect administrator password.")
+            self.password_var.set("")
+            self.after_idle(self.password_entry.focus_force)
+            return
+
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+
+        parent = self.parent
+        self.destroy()
+        try:
+            parent._admin_password_dialog = None
+            parent.after_idle(self.on_success)
+        except (AttributeError, tk.TclError):
+            pass
+
+
+class AdminConfigScreen(tk.Toplevel):
+    """Administrator-only editor for the admin config and audit-log paths."""
+
+    WIDTH = 720
+    HEIGHT = 410
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+
+        self.title("Administrator Configuration")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        center_over(self, parent, self.WIDTH, self.HEIGHT, reveal=False)
+        self.iconbitmap(resource_path("Martins-Distribution_RGB.ico"))
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        current_admin_path = get_admin_config_path()
+        if current_admin_path.exists() and current_admin_path.is_dir():
+            current_admin_path = current_admin_path / "admin_config.json"
+        elif not current_admin_path.suffix:
+            current_admin_path = current_admin_path.with_name(
+                current_admin_path.name + ".json"
+            )
+
+        current_audit_path = get_audit_log_path()
+        if current_audit_path:
+            audit_path = Path(current_audit_path).expanduser()
+            if audit_path.exists() and audit_path.is_dir():
+                audit_path = audit_path / "app_audit_log.log"
+            elif not audit_path.suffix:
+                audit_path = audit_path.with_name(
+                    audit_path.name + ".log"
+                )
+        else:
+            audit_path = DEFAULT_AUDIT_LOG_FILE
+
+        self.admin_config_path_var = tk.StringVar(value=str(current_admin_path))
+        self.audit_log_path_var = tk.StringVar(value=str(audit_path))
+
+        self._build_ui()
+
+        # Reveal only after every widget has been created.
+        self.deiconify()
+        bring_to_front(self)
+        self.after_idle(self._activate_modal)
+
+    def _activate_modal(self):
+        if not self.winfo_exists():
+            return
+        try:
+            self.grab_set()
+            self.lift()
+            self.focus_force()
+        except tk.TclError:
+            pass
+
+    def _close(self):
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        parent = self.parent
+        self.destroy()
+        try:
+            if getattr(parent, "_admin_config_window", None) is self:
+                parent._admin_config_window = None
+            parent.after_idle(parent.focus_force)
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _build_ui(self):
+        title_frame = tk.Frame(self, bg=BG)
+        title_frame.pack(fill="x", padx=24, pady=(24, 4))
+
+        tk.Label(
+            title_frame,
+            text="Administrator Configuration",
+            bg=BG,
+            fg=TEXT,
+            font=("Segoe UI", 15, "bold"),
+            anchor="w",
+        ).pack(side="left")
+
+        divider(self)
+
+        tk.Label(
+            self,
+            text=(
+                "These settings control where MDIP stores administrator "
+                "configuration and the shared audit log. They are not "
+                "available in the normal user configuration."
+            ),
+            bg=BG,
+            fg=TEXT_MUTED,
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+            wraplength=670,
+        ).pack(fill="x", padx=24, pady=(0, 18))
+
+        self._path_row(
+            "Administrator configuration file",
+            self.admin_config_path_var,
+            "Choose administrator configuration file",
+            ".json",
+            [("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        self._path_row(
+            "Shared audit log file",
+            self.audit_log_path_var,
+            "Choose shared audit log file",
+            ".log",
+            [("Log files", "*.log"), ("All files", "*.*")],
+        )
+
+        self.validation_label = tk.Label(
+            self,
+            text="",
+            bg=BG,
+            fg=ERROR_FG,
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+            wraplength=670,
+        )
+        self.validation_label.pack(fill="x", padx=24, pady=(8, 10))
+
+        button_row = tk.Frame(self, bg=BG)
+        button_row.pack(fill="x", padx=24, pady=(0, 20))
+
+        tk.Button(
+            button_row,
+            text="Cancel",
+            command=self._close,
+            font=("Segoe UI", 9),
+            bg=PANEL,
+            fg=TEXT_MUTED,
+            relief="flat",
+            cursor="hand2",
+            padx=14,
+            pady=8,
+        ).pack(side="left")
+
+        tk.Button(
+            button_row,
+            text="Save Administrator Settings",
+            command=self._save,
+            font=("Segoe UI", 10, "bold"),
+            bg=ACCENT,
+            fg="white",
+            activebackground=ACCENT_DARK,
+            activeforeground="white",
+            relief="flat",
+            cursor="hand2",
+            padx=14,
+            pady=8,
+        ).pack(side="right")
+
+    def _path_row(self, label_text, path_var, dialog_title, extension, filetypes):
+        tk.Label(
+            self,
+            text=label_text,
+            bg=BG,
+            fg=TEXT_MUTED,
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).pack(fill="x", padx=24, pady=(0, 2))
+
+        row = tk.Frame(self, bg=BG)
+        row.pack(fill="x", padx=24, pady=(0, 14))
+
+        tk.Entry(
+            row,
+            textvariable=path_var,
+            font=("Segoe UI", 9),
+            bg=PANEL,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+            highlightbackground=BORDER,
+            highlightthickness=1,
+        ).pack(side="left", fill="x", expand=True, ipady=6, padx=(0, 8))
+
+        tk.Button(
+            row,
+            text="Browse…",
+            command=lambda: self._browse_path(
+                path_var, dialog_title, extension, filetypes
+            ),
+            font=("Segoe UI", 9),
+            bg=PANEL,
+            fg=ACCENT,
+            activebackground=DROP_HOVER,
+            activeforeground=ACCENT_DARK,
+            relief="flat",
+            cursor="hand2",
+            padx=10,
+            pady=6,
+        ).pack(side="right")
+
+    @staticmethod
+    def _ensure_extension(path_text: str, extension: str) -> str:
+        path = Path(path_text).expanduser()
+        if path.suffix.lower() != extension.lower():
+            path = path.with_suffix(extension)
+        return str(path)
+
+    def _browse_path(self, path_var, title, extension, filetypes):
+        current = path_var.get().strip()
+        initialdir = None
+        initialfile = ""
+
+        if current:
+            current_path = Path(current).expanduser()
+            initialfile = current_path.name
+            if current_path.parent.exists():
+                initialdir = str(current_path.parent)
+
+        selected = filedialog.asksaveasfilename(
+            title=title,
+            initialdir=initialdir,
+            initialfile=initialfile,
+            defaultextension=extension,
+            filetypes=filetypes,
+        )
+        if selected:
+            path_var.set(self._ensure_extension(selected, extension))
+
+    def _save(self):
+        admin_path = self.admin_config_path_var.get().strip()
+        audit_path = self.audit_log_path_var.get().strip()
+
+        if not admin_path:
+            self.validation_label.configure(
+                text="Administrator configuration file path is required."
+            )
+            return
+
+        if not audit_path:
+            self.validation_label.configure(
+                text="Shared audit log file path is required."
+            )
+            return
+
+        admin_path = self._ensure_extension(admin_path, ".json")
+        audit_path = self._ensure_extension(audit_path, ".log")
+
+        admin_candidate = Path(admin_path).expanduser()
+        audit_candidate = Path(audit_path).expanduser()
+
+        # A file path is required.  If the administrator entered a directory,
+        # convert it to the intended default filename rather than attempting to
+        # replace the directory itself.
+        if admin_candidate.exists() and admin_candidate.is_dir():
+            admin_candidate = admin_candidate / "admin_config.json"
+            admin_path = str(admin_candidate)
+
+        if audit_candidate.exists() and audit_candidate.is_dir():
+            audit_candidate = audit_candidate / "app_audit_log.log"
+            audit_path = str(audit_candidate)
+
+        if admin_candidate.name.lower() == "mdip_admin":
+            admin_candidate = admin_candidate.with_name("admin_config.json")
+            admin_path = str(admin_candidate)
+
+        try:
+            if admin_candidate.parent == admin_candidate:
+                raise ValueError("Invalid administrator configuration file path.")
+
+            admin_candidate.parent.mkdir(parents=True, exist_ok=True)
+
+            # Verify that the administrator can write the JSON file location.
+            # save_admin_config performs the atomic write after this check.
+            probe_path = admin_candidate.parent / f".mdip_write_test_{uuid.uuid4().hex}.tmp"
+            try:
+                probe_path.write_text("", encoding="utf-8")
+            finally:
+                try:
+                    probe_path.unlink()
+                except OSError:
+                    pass
+
+            audit_candidate.parent.mkdir(parents=True, exist_ok=True)
+            with audit_candidate.open("a", encoding="utf-8"):
+                pass
+
+            data = save_admin_config(admin_path, audit_path)
+
+            global AUDIT_LOG_PATH
+            AUDIT_LOG_PATH = data.get("audit_log_path")
+            reconfigure_logging(AUDIT_LOG_PATH)
+
+        except Exception as exc:
+            try:
+                _logger.error(
+                    "Administrator configuration update failed | Exception: %s",
+                    f"{type(exc).__name__}: {exc}",
+                    extra={
+                        "user": CURRENT_USER,
+                        "invoice_number": "ADMIN_CONFIG",
+                    },
+                    exc_info=True,
+                )
+            except Exception:
+                pass
+
+            self.validation_label.configure(
+                text=(
+                    "Could not save administrator settings. "
+                    f"Exception: {type(exc).__name__}: {exc}"
+                )
+            )
+            return
+
+        messagebox.showinfo(
+            "Administrator Settings Saved",
+            "The administrator configuration was created/updated and "
+            "MDIP is now using the new shared audit-log location.",
+            parent=self,
+        )
+        self._close()
+
 
 class ProcessingDialog(tk.Toplevel):
     """
@@ -462,6 +1063,7 @@ class ProcessingDialog(tk.Toplevel):
         self.is_finished = False
         self.success = False
         self.output_paths: list[str] = []
+        self.processing_results: list[dict] = []
         self.error_message = ""
 
         self.title("Processing Invoices")
@@ -584,23 +1186,49 @@ class ProcessingDialog(tk.Toplevel):
 
             before_count = len(self.output_paths)
 
-            run_pipeline(
+            processing_result = run_pipeline(
                 pdf_path,
                 self._output_folder,
                 callback,
                 po_exception_approved=pdf_path in self.po_exceptions,
             )
 
-            # If this invoice did not create an output file, its pipeline
-            # encountered an error and the batch should stop.
-            if len(self.output_paths) == before_count:
+            if (
+                not processing_result
+                or processing_result.get("status") != "SUCCESS"
+                or len(self.output_paths) == before_count
+            ):
+                exception_detail = ""
+                if isinstance(processing_result, dict) and processing_result.get("error_type"):
+                    exception_detail = (
+                        f" Exception: {processing_result.get('error_type')}: "
+                        f"{processing_result.get('error_message', '')}"
+                    )
+
+                log_batch_error(
+                    _logger,
+                    user=CURRENT_USER,
+                    machine=CURRENT_MACHINE,
+                    invoices=self._build_attempted_invoice_records(),
+                    exceptions=self._build_approved_exception_records(),
+                    failed_invoice=invoice_name,
+                    detail=(
+                        f"Processing stopped while handling {invoice_name}."
+                        f"{exception_detail}"
+                    ),
+                )
                 self.parent.after(
                     0,
                     self._finish_batch,
                     False,
-                    f"Processing stopped while handling {invoice_name}.",
+                    (
+                        f"Processing stopped while handling {invoice_name}."
+                        f"{exception_detail}"
+                    ),
                 )
                 return
+
+            self.processing_results.append(processing_result)
 
         self.parent.after(0, self._finish_batch, True, "")
 
@@ -610,22 +1238,80 @@ class ProcessingDialog(tk.Toplevel):
         self.error_message = error_message
 
         if success:
-            # A batch enters history only when every selected invoice completed successfully.
+            history_records = self._build_history_invoice_records()
+            approved_exceptions = self._build_approved_exception_records()
+
+            batch_record = None
             try:
-                history_manager.record_batch(
+                batch_record = history_manager.record_batch(
                     user=CURRENT_USER,
                     machine=CURRENT_MACHINE,
-                    invoices=self._build_history_invoice_records(),
+                    invoices=history_records,
                 )
             except Exception as exc:
-                # History must not block a successful batch, but failures must
-                # remain visible for troubleshooting.
                 _logger.error(
-                    "History recording failed: %s",
-                    exc,
+                    "History recording failed | Exception: %s",
+                    f"{type(exc).__name__}: {exc}",
                     extra={
                         "user": CURRENT_USER,
+                        "machine": CURRENT_MACHINE,
                         "invoice_number": "HISTORY",
+                    },
+                    exc_info=True,
+                )
+
+            batch_id = (
+                batch_record.get("batch_id")
+                if isinstance(batch_record, dict)
+                else None
+            ) or (
+                f"BATCH-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                f"-{uuid.uuid4().hex[:4].upper()}"
+            )
+            batch_timestamp = (
+                batch_record.get("timestamp")
+                if isinstance(batch_record, dict)
+                else None
+            )
+
+            try:
+                log_batch_event(
+                    _logger,
+                    user=CURRENT_USER,
+                    machine=CURRENT_MACHINE,
+                    batch_id=batch_id,
+                    invoices=history_records,
+                    exceptions=approved_exceptions,
+                )
+            except Exception as exc:
+                _logger.error(
+                    "Batch audit logging failed | Exception: %s",
+                    f"{type(exc).__name__}: {exc}",
+                    extra={
+                        "user": CURRENT_USER,
+                        "machine": CURRENT_MACHINE,
+                        "invoice_number": "BATCH",
+                    },
+                    exc_info=True,
+                )
+
+            try:
+                update_latest_invoices(
+                    AUDIT_LOG_PATH,
+                    history_records,
+                    batch_id=batch_id,
+                    timestamp=batch_timestamp,
+                    user=CURRENT_USER,
+                    machine=CURRENT_MACHINE,
+                )
+            except Exception as exc:
+                _logger.error(
+                    "System-wide latest invoice update failed | Exception: %s",
+                    f"{type(exc).__name__}: {exc}",
+                    extra={
+                        "user": CURRENT_USER,
+                        "machine": CURRENT_MACHINE,
+                        "invoice_number": "LATEST",
                     },
                     exc_info=True,
                 )
@@ -656,10 +1342,14 @@ class ProcessingDialog(tk.Toplevel):
         self.close_btn.configure(state="normal", bg=ACCENT)
 
     def _build_history_invoice_records(self) -> list[dict]:
-        """Build compact invoice records for the local recent-history store."""
+        """Build detailed invoice records for history and audit tracking."""
         results_by_path = {
             os.path.normcase(os.path.abspath(result.invoice_path)): result
             for result in self.validation_results
+        }
+        processing_by_invoice = {
+            str(result.get("invoice_number") or "UNKNOWN").strip().upper(): result
+            for result in self.processing_results
         }
 
         records = []
@@ -667,15 +1357,86 @@ class ProcessingDialog(tk.Toplevel):
             result = results_by_path.get(
                 os.path.normcase(os.path.abspath(pdf_path))
             )
+            processing = processing_by_invoice.get(
+                str(result.invoice_number if result else "UNKNOWN").strip().upper(),
+                {},
+            )
 
-            records.append({
+            record = {
                 "invoice_number": result.invoice_number if result else None,
                 "client": result.client if result else None,
                 "delivery_date": result.delivery_date if result else None,
                 "source_file": os.path.basename(pdf_path),
                 "output_file": os.path.basename(output_path),
+                "file_size_kb": processing.get("file_size_kb"),
+                "duration_s": processing.get("duration_s"),
+                "item_count": processing.get("item_count"),
                 "exception_approved": pdf_path in self.po_exceptions,
+            }
+
+            if record["exception_approved"] and result:
+                record["exception_reason"] = result.message
+
+            records.append(record)
+
+        return records
+
+    def _build_approved_exception_records(self) -> list[dict]:
+        """Return approved exceptions with the original validation problem."""
+        results_by_path = {
+            os.path.normcase(os.path.abspath(result.invoice_path)): result
+            for result in self.validation_results
+        }
+
+        records = []
+        for pdf_path in self.po_exceptions:
+            result = results_by_path.get(
+                os.path.normcase(os.path.abspath(pdf_path))
+            )
+            if not result:
+                continue
+
+            records.append({
+                "invoice_number": result.invoice_number,
+                "client": result.client,
+                "delivery_date": result.delivery_date,
+                "source_file": os.path.basename(result.invoice_path),
+                "exception_type": "Customer PO exception",
+                "reason": result.message,
+                "approved": True,
             })
+
+        return records
+
+    def _build_attempted_invoice_records(self) -> list[dict]:
+        """Build useful metadata for a failed batch without recording it as successful."""
+        records = self._build_history_invoice_records()
+        recorded_sources = {record.get("source_file") for record in records}
+
+        for pdf_path in self.pdf_paths:
+            source_file = os.path.basename(pdf_path)
+            if source_file in recorded_sources:
+                continue
+
+            result = next(
+                (
+                    item for item in self.validation_results
+                    if os.path.normcase(os.path.abspath(item.invoice_path))
+                    == os.path.normcase(os.path.abspath(pdf_path))
+                ),
+                None,
+            )
+            record = {
+                "invoice_number": result.invoice_number if result else None,
+                "client": result.client if result else None,
+                "delivery_date": result.delivery_date if result else None,
+                "source_file": source_file,
+                "output_file": None,
+                "exception_approved": pdf_path in self.po_exceptions,
+            }
+            if record["exception_approved"] and result:
+                record["exception_reason"] = result.message
+            records.append(record)
 
         return records
 
@@ -867,6 +1628,15 @@ class ValidationDialog(tk.Toplevel):
             except Exception as exc:
                 from types import SimpleNamespace
 
+                log_invoice_error(
+                    _logger,
+                    user=CURRENT_USER,
+                    machine=CURRENT_MACHINE,
+                    invoice_number="UNKNOWN",
+                    detail=f"Validation scan failed for {os.path.basename(pdf_path)}.",
+                    exc=exc,
+                )
+
                 self.results.append(
                     SimpleNamespace(
                         invoice_path=pdf_path,
@@ -877,7 +1647,9 @@ class ValidationDialog(tk.Toplevel):
                         delivery_date=None,
                         valid=False,
                         can_approve_exception=False,
-                        message=f"Could not scan invoice: {exc}",
+                        message=(
+                            f"Could not scan invoice: {type(exc).__name__}: {exc}"
+                        ),
                     )
                 )
 
@@ -992,6 +1764,7 @@ class ValidationDialog(tk.Toplevel):
                     f"Client: {result.client}\n"
                     f"Delivery Date: {result.delivery_date or 'UNKNOWN'}\n\n"
                     "The Customer PO field is blank.\n\n"
+                    f"Validation result: {result.message}\n\n"
                     "Approve this invoice as an office-created "
                     "second-delivery or system created invoice exception?\n\n"
                     "If approved, the outbound CSV Customer PO will be "
@@ -1037,75 +1810,112 @@ class ValidationDialog(tk.Toplevel):
 
 
 class HistoryDialog(tk.Toplevel):
-    """Display the two most recent successfully completed processing batches."""
+    """Display system-wide latest invoices and local recent processing history."""
 
-    WIDTH = 700
-    HEIGHT = 520
+    WIDTH = 760
+    HEIGHT = 680
 
-    def __init__(self, parent):
+    SYSTEM_WIDE_CLIENTS = (
+        "Taco Bamba",
+        "Velvet Taco — North Hills",
+        "Velvet Taco — Southend",
+        "Velvet Taco — Park Road",
+    )
+
+    def __init__(self, parent, owner=None):
         super().__init__(parent)
         self.parent = parent
+        self.owner = owner
         self.title("Processing History")
         self.configure(bg=BG)
         self.resizable(False, False)
         center_over(self, parent, self.WIDTH, self.HEIGHT)
         bring_to_front(self)
         self.iconbitmap(resource_path("Martins-Distribution_RGB.ico"))
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.protocol("WM_DELETE_WINDOW", self._close)
 
         self._build_ui()
         self._load_history()
 
+    def _close(self):
+        try:
+            if self.owner is not None and getattr(self.owner, "_history_window", None) is self:
+                self.owner._history_window = None
+        except (AttributeError, tk.TclError):
+            pass
+        self.destroy()
+
     def _build_ui(self):
         tk.Label(
-            self,
-            text="Recent Processing History",
-            bg=BG,
-            fg=TEXT,
-            font=("Segoe UI", 14, "bold"),
-            anchor="w",
+            self, text="Processing History", bg=BG, fg=TEXT,
+            font=("Segoe UI", 14, "bold"), anchor="w",
         ).pack(fill="x", padx=24, pady=(24, 6))
+
+        system_frame = tk.Frame(
+            self, bg=PANEL, highlightbackground=BORDER, highlightthickness=1
+        )
+        system_frame.pack(fill="x", padx=24, pady=(0, 14))
+
+        tk.Label(
+            system_frame,
+            text="System-wide latest successfully sent invoice",
+            bg=PANEL, fg=TEXT, font=("Segoe UI", 10, "bold"), anchor="w",
+        ).pack(fill="x", padx=14, pady=(12, 2))
+
+        tk.Label(
+            system_frame,
+            text="Highest invoice number recorded for each client/location from the shared audit location.",
+            bg=PANEL, fg=TEXT_MUTED, font=("Segoe UI", 8), anchor="w",
+            wraplength=680, justify="left",
+        ).pack(fill="x", padx=14, pady=(0, 8))
+
+        self.latest_text = tk.Text(
+            system_frame, height=7, bg=PANEL, fg=TEXT,
+            relief="flat", borderwidth=0, highlightthickness=0,
+            wrap="word", state="disabled", font=("Segoe UI", 9),
+        )
+        self.latest_text.pack(fill="x", padx=14, pady=(0, 12))
+
+        tk.Label(
+            self, text="Local recent batches", bg=BG, fg=TEXT,
+            font=("Segoe UI", 10, "bold"), anchor="w",
+        ).pack(fill="x", padx=24, pady=(0, 4))
 
         tk.Label(
             self,
-            text="The two most recent successfully completed batches are shown below.",
-            bg=BG,
-            fg=TEXT_MUTED,
-            font=("Segoe UI", 9),
-            anchor="w",
-        ).pack(fill="x", padx=24, pady=(0, 12))
+            text="The 10 most recent successfully completed batches recorded on this computer.",
+            bg=BG, fg=TEXT_MUTED, font=("Segoe UI", 9), anchor="w",
+        ).pack(fill="x", padx=24, pady=(0, 8))
 
         frame = tk.Frame(self, bg=BG)
         frame.pack(fill="both", expand=True, padx=24, pady=(0, 12))
 
         self.history_text = tk.Text(
-            frame,
-            bg=PANEL,
-            fg=TEXT,
-            relief="flat",
-            highlightbackground=BORDER,
-            highlightthickness=1,
-            wrap="word",
-            state="disabled",
-            font=("Segoe UI", 9),
+            frame, bg=PANEL, fg=TEXT, relief="flat",
+            highlightbackground=BORDER, highlightthickness=1,
+            wrap="word", state="disabled", font=("Segoe UI", 9),
         )
         scrollbar = tk.Scrollbar(frame, orient="vertical", command=self.history_text.yview)
         self.history_text.configure(yscrollcommand=scrollbar.set)
         self.history_text.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
+        button_row = tk.Frame(self, bg=BG)
+        button_row.pack(fill="x", padx=24, pady=(0, 20))
+
         tk.Button(
-            self,
-            text="Close",
-            command=self.destroy,
-            font=("Segoe UI", 10, "bold"),
-            bg=ACCENT,
-            fg="white",
-            activebackground=ACCENT_DARK,
-            relief="flat",
-            cursor="hand2",
-            pady=8,
-        ).pack(fill="x", padx=24, pady=(0, 20))
+            button_row, text="Refresh", command=self._load_history,
+            font=("Segoe UI", 9, "bold"), bg=PANEL, fg=ACCENT,
+            activebackground=DROP_HOVER, relief="flat", cursor="hand2",
+            padx=12, pady=8,
+        ).pack(side="left")
+
+        tk.Button(
+            button_row, text="Close", command=self._close,
+            font=("Segoe UI", 10, "bold"), bg=ACCENT, fg="white",
+            activebackground=ACCENT_DARK, relief="flat", cursor="hand2",
+            padx=16, pady=8,
+        ).pack(side="right")
 
     @staticmethod
     def _format_timestamp(value: str | None) -> str:
@@ -1116,7 +1926,39 @@ class HistoryDialog(tk.Toplevel):
         except ValueError:
             return value
 
+    def _load_system_latest(self):
+        latest = get_latest_invoices(AUDIT_LOG_PATH)
+
+        self.latest_text.configure(state="normal")
+        self.latest_text.delete("1.0", "end")
+
+        if not AUDIT_LOG_PATH:
+            self.latest_text.insert(
+                "end",
+                "System-wide tracking is not configured on this computer.\n"
+                "An administrator must configure audit_log_path before shared latest-invoice data can be recorded.",
+            )
+        else:
+            for client in self.SYSTEM_WIDE_CLIENTS:
+                record = latest.get(client)
+                if not record:
+                    self.latest_text.insert(
+                        "end", f"{client}: No system-wide invoice recorded yet.\n"
+                    )
+                    continue
+
+                self.latest_text.insert(
+                    "end",
+                    f"{client}: Invoice {record.get('invoice_number', 'UNKNOWN')}"
+                    f" | Delivery: {record.get('delivery_date') or 'UNKNOWN'}"
+                    f" | Sent: {self._format_timestamp(record.get('processed_at'))}"
+                    f" | By: {record.get('user', 'UNKNOWN')} ({record.get('machine', 'UNKNOWN')})\n",
+                )
+
+        self.latest_text.configure(state="disabled")
+
     def _load_history(self):
+        self._load_system_latest()
         batches = history_manager.get_recent_batches()
         self.history_text.configure(state="normal")
         self.history_text.delete("1.0", "end")
@@ -1124,7 +1966,7 @@ class HistoryDialog(tk.Toplevel):
         if not batches:
             self.history_text.insert(
                 "end",
-                "No successfully completed processing batches have been recorded yet.",
+                "No successfully completed processing batches have been recorded on this computer yet.",
             )
             self.history_text.configure(state="disabled")
             return
@@ -1143,15 +1985,21 @@ class HistoryDialog(tk.Toplevel):
             )
 
             for invoice in batch.get("invoices", []):
-                exception = " — PO exception approved" if invoice.get("exception_approved") else ""
+                exception = ""
+                if invoice.get("exception_approved"):
+                    exception = (
+                        " — PO exception approved: "
+                        + str(invoice.get("exception_reason") or "Reason not recorded")
+                    )
                 self.history_text.insert(
                     "end",
                     f"  • {invoice.get('invoice_number') or 'UNKNOWN'}"
-                    f" — {invoice.get('client') or 'UNKNOWN'}{exception}\n"
-                    f"    Delivery Date: {invoice.get('delivery_date') or 'UNKNOWN'}\n",
+                    f" — {invoice.get('client') or 'UNKNOWN'}"
+                    f" — Delivery: {invoice.get('delivery_date') or 'UNKNOWN'}"
+                    f"{exception}\n",
                 )
 
-            self.history_text.insert("end", "\n" + ("─" * 52) + "\n\n")
+            self.history_text.insert("end", "\n" + ("─" * 70) + "\n\n")
 
         self.history_text.configure(state="disabled")
 
@@ -1167,6 +2015,8 @@ class MainScreen(tk.Frame):
         self.config = config
         # All PDFs selected for the current processing session.
         self.selected_files: list[str] = []
+        self._config_window = None
+        self._history_window = None
         self._build_ui()
 
         if DND_AVAILABLE:
@@ -1438,14 +2288,39 @@ class MainScreen(tk.Frame):
     # ── Config ────────────────────────────────────────────────────────
 
     def _open_config(self):
-        ConfigScreen(
+        # Keep a Python reference to the Toplevel. Without this reference,
+        # Python can garbage-collect the window immediately after creation,
+        # causing the Configuration window to appear and then disappear.
+        if self._config_window is not None:
+            try:
+                if self._config_window.winfo_exists():
+                    self._config_window.lift()
+                    self._config_window.focus_force()
+                    return
+            except tk.TclError:
+                pass
+
+        self._config_window = ConfigScreen(
             parent=self.parent,
             current_config=self.config,
             on_save=self.update_config,
             is_first_launch=False,
         )
+
     def _open_history(self):
-        HistoryDialog(self.parent)
+        if self._history_window is not None:
+            try:
+                if self._history_window.winfo_exists():
+                    self._history_window.lift()
+                    self._history_window.focus_force()
+                    return
+            except tk.TclError:
+                pass
+
+        self._history_window = HistoryDialog(
+            self.parent,
+            owner=self,
+        )
 
 
     # ── Processing ────────────────────────────────────────────────────
@@ -1571,26 +2446,27 @@ class App:
         bring_to_front(self.root)
         self.root.iconbitmap(resource_path("Martins-Distribution_RGB.ico"))
 
-        # ── Config migration ──────────────────────────────────────────
-        # Existing installs won't have "log_path" in their config.json
-        # (it was only added this session).  If the key is absent, write the
-        # placeholder in now so the file is always up to date after first run.
+        # User configuration contains only input/output folders.
+        # Remove legacy log_path data so users cannot control the audit destination.
         config = load_config()
-        if "log_path" not in config:
-            config["log_path"] = "\\\\SERVER\\MDIPLogs\\app.log"
-            # Only save if there's already a real config worth preserving —
-            # first-launch configs are saved by ConfigScreen._save() instead.
+        if "log_path" in config:
+            config.pop("log_path", None)
             if is_config_valid(config):
                 save_config(config)
 
-        # Initialise logging before anything else runs
-        setup_logging(config.get("log_path"))
+        # Shared audit configuration is administrator-controlled and loaded
+        # from the machine-wide admin-config location.
+        global AUDIT_LOG_PATH
+        self.config_screen = None
+        admin_config = load_admin_config()
+        AUDIT_LOG_PATH = get_audit_log_path(admin_config)
+        setup_logging(AUDIT_LOG_PATH)
 
         if not is_config_valid(config):
             # First launch — hide the main window until config is saved
             self.root.withdraw()
             self.main_screen = None
-            ConfigScreen(
+            self.config_screen = ConfigScreen(
                 parent=self.root,
                 current_config=config,
                 on_save=self._on_first_config_save,
@@ -1602,6 +2478,7 @@ class App:
         self.root.mainloop()
 
     def _on_first_config_save(self, config: dict):
+        self.config_screen = None
         self.root.deiconify()
         self._show_main(config)
 
